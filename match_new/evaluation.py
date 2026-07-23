@@ -577,7 +577,7 @@ def build_effective_config_snapshot(config: dict[str, Any]) -> dict[str, Any]:
         snapshot["output"] = output_cfg
 
     data_cfg = dict(snapshot.get("data", {}))
-    for field in ("metadata_csv", "image_root"):
+    for field in ("image_root",):
         if field in data_cfg:
             data_cfg[field] = _resolve_config_path(config, data_cfg.get(field)) or data_cfg.get(field)
     if data_cfg:

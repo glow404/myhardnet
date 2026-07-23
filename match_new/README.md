@@ -23,7 +23,8 @@ conda activate hardnet-cuda
 | `runtime.skip_template_build` | 是否复用已有模板 |
 | `runtime.max_impostor_identities_per_query` | 每个 query 最多测几个非本人身份，`0`=全量 |
 | `runtime.limit_identities` / `limit_images_per_identity` | 调试裁剪，正式实验保持 `0` |
-| `data.metadata_csv` | 图像索引 CSV |
+| `data.image_root` | 原始指纹图像根目录 |
+| `data.identity_depth` | 组成一个手指 identity 的目录层级数 |
 | `model.checkpoint` | HardNet 权重 |
 | `enrollment.random_seed` | 注册/query 划分种子 |
 | `texture_verification.*` | 局部脊线纹理二次筛选及灰区提升参数 |
@@ -37,6 +38,14 @@ conda activate hardnet-cuda
 
 ```powershell
 python match_new\run_hardnet_matching.py
+```
+
+也可以直接覆盖原图目录及身份目录层级，无需预先运行 `pair_build`：
+
+```powershell
+python match_new\run_hardnet_matching.py `
+  --image-root D:\datasets\tiny_v12 `
+  --identity-depth 2
 ```
 
 **临时覆盖示例**：
@@ -62,7 +71,8 @@ python match_new\run_hardnet_matching.py `
 | 参数 | 作用 |
 |------|------|
 | `--config` | 配置文件路径，默认 `match_new/config_match_new.yaml` |
-| `--metadata` | 覆盖 `data.metadata_csv` |
+| `--image-root` | 覆盖 `data.image_root` |
+| `--identity-depth` | 覆盖 `data.identity_depth` |
 | `--model_path` | 覆盖 `model.checkpoint` |
 | `--output_dir` | 覆盖 `output.output_dir` |
 | `--skip-template-build` / `--no-skip-template-build` | 覆盖是否跳过模板构建 |

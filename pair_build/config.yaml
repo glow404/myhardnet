@@ -19,10 +19,10 @@
 paths:
   # 原始小局部指纹图像根目录。目录层级默认形如：
   #   data/butieping/fys_R0/Rgd1237/xxx_pair0.bmp
-  data_root: ysjz_V4
+  data_root: tiny_v12
   # 输出目录。会写入 sample_index.csv、split_assignments.csv、
   # all_positive_pairs.csv、patches/、QA 报告等产物。
-  output_root: ../outputs/ysjz_V4
+  output_root: ../outputs/tiny_v12
 
 # 日志相关配置。
 logging:

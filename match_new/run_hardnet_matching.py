@@ -1,7 +1,7 @@
 """HardNet L2 手机解锁式指纹验证主入口。
 
 作用：
-    1. 读取 metadata，构建每张图像的 `.npz` 模板；
+    1. 扫描原始指纹图像目录，构建每张图像的 `.npz` 模板；
     2. 每个 identity 随机选择注册模板；
     3. 用其余图像作为 query，分别对本人和非本人 identity 模板库打分；
     4. 输出 FAR/FRR/EER/AUC、满足目标 FAR/FRR 的推荐阈值；
@@ -31,7 +31,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from match_new.evaluation import run_hardnet_evaluation, summary_row
-from match_new.template_builder import build_hardnet_templates, build_identity_templates, load_image_template, load_or_build_metadata
+from match_new.input_loader import load_raw_image_metadata, validate_identity_image_counts
+from match_new.template_builder import build_hardnet_templates, build_identity_templates, load_image_template
 from match_new.utils import ensure_dir, load_config, read_csv_rows, resolve_path, template_filename, write_csv_rows, write_json
 
 
@@ -122,11 +123,21 @@ def parse_args() -> argparse.Namespace:
         description="Run HardNet L2 phone-unlock matching experiment. Defaults come from --config YAML.",
     )
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="配置文件路径。")
-    parser.add_argument("--metadata", default=None, help="覆盖 data.metadata_csv。")
+    parser.add_argument("--image-root", "--image_root", dest="image_root", default=None, help="覆盖 data.image_root。")
+    parser.add_argument(
+        "--identity-depth",
+        "--identity_depth",
+        dest="identity_depth",
+        type=int,
+        default=None,
+        help="覆盖 data.identity_depth。",
+    )
     parser.add_argument("--model_path", default=None, help="覆盖 model.checkpoint。")
     parser.add_argument("--output_dir", default=None, help="覆盖 output.output_dir。")
     parser.add_argument(
+        "--skip-template-build",
         "--skip_template_build",
+        dest="skip_template_build",
         action=argparse.BooleanOptionalAction,
         default=None,
         help="覆盖 runtime.skip_template_build。可用 --skip-template-build / --no-skip-template-build。",
@@ -137,7 +148,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target_frr", type=float, default=None, help="覆盖 evaluation.target_frr。")
     parser.add_argument("--max_failure_cases_per_type", type=int, default=None, help="覆盖 evaluation.failure_export.max_cases_per_type。")
     parser.add_argument(
+        "--failure-export",
         "--failure_export",
+        dest="failure_export",
         action=argparse.BooleanOptionalAction,
         default=None,
         help="覆盖 evaluation.failure_export.enabled。可用 --failure-export / --no-failure-export。",
@@ -150,8 +163,10 @@ def parse_args() -> argparse.Namespace:
 def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
     """把命令行覆盖项写回 config。仅当命令行显式传入时覆盖。"""
 
-    if args.metadata is not None:
-        config.setdefault("data", {})["metadata_csv"] = str(Path(args.metadata).expanduser().resolve())
+    if args.image_root is not None:
+        config.setdefault("data", {})["image_root"] = str(Path(args.image_root).expanduser().resolve())
+    if args.identity_depth is not None:
+        config.setdefault("data", {})["identity_depth"] = int(args.identity_depth)
     if args.model_path:
         config.setdefault("model", {})["checkpoint"] = str(Path(args.model_path).expanduser().resolve())
     if args.output_dir is not None:
@@ -266,12 +281,15 @@ def main() -> None:
     if not checkpoint.exists() and not settings["skip_template_build"]:
         raise FileNotFoundError(f"HardNet checkpoint does not exist: {checkpoint}")
 
-    # 1. 读取或扫描 metadata，并可选做调试裁剪。
+    # 1. Scan raw images directly and optionally limit the dataset for debugging.
     output_dir = ensure_dir(settings["output_dir"])
-    rows = load_or_build_metadata(config, None)
+    rows = load_raw_image_metadata(config)
     rows = limit_rows_for_debug(rows, int(settings["limit_identities"]), int(settings["limit_images_per_identity"]))
     if not rows:
-        raise RuntimeError("No metadata rows found.")
+        raise RuntimeError("No raw fingerprint images found.")
+    enrollment = dict(config.get("enrollment", {}))
+    enrollment_count = int(enrollment.get("enrollment_images_per_identity", 20))
+    validate_identity_image_counts(rows, enrollment_count + 1, context="raw image input")
     write_csv_rows(output_dir / "metadata_all.csv", rows)
 
     # 2. 构建图像级模板；如果 skip_template_build，则复用已有模板。
@@ -279,7 +297,13 @@ def main() -> None:
     metadata_success_path = output_dir / "metadata_success.csv"
     if settings["skip_template_build"]:
         candidate_rows = read_csv_rows(metadata_success_path) if metadata_success_path.exists() else rows
-        success_rows = [row for row in candidate_rows if (template_dir / template_filename(row["identity_id"], row["image_id"])).exists()]
+        raw_keys = {(row["identity_id"], row["image_id"]) for row in rows}
+        success_rows = [
+            row
+            for row in candidate_rows
+            if (row["identity_id"], row["image_id"]) in raw_keys
+            and (template_dir / template_filename(row["identity_id"], row["image_id"])).exists()
+        ]
         if not success_rows:
             raise RuntimeError("skip_template_build was set but no image templates were found.")
     else:
@@ -290,11 +314,10 @@ def main() -> None:
         if not success_rows:
             raise RuntimeError("No templates were built successfully.")
     write_csv_rows(metadata_success_path, success_rows)
+    validate_identity_image_counts(success_rows, enrollment_count + 1, context="successfully built templates")
     write_json(output_dir / "template_validation.json", validate_templates(template_dir, success_rows, config))
 
     # 3. 固定随机种子，为每个 identity 选择注册模板，其余作为 query。
-    enrollment = dict(config.get("enrollment", {}))
-    enrollment_count = int(enrollment.get("enrollment_images_per_identity", 20))
     identity_templates_path = output_dir / f"identity_templates_{enrollment_count}.json"
     split_metadata_path = output_dir / f"metadata_with_split_{enrollment_count}.csv"
     identity_payload = build_identity_templates(

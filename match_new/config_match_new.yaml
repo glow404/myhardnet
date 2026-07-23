@@ -11,10 +11,10 @@
 output:
   # 实验结果根目录。相对路径相对本配置文件所在目录解析。
   # 其下会生成 image_templates/、eval_hardnet_l2/、各类 CSV/JSON 等。
-  output_dir: ysjz_V4
+  output_dir: Quant_tiny_V1_4
 
 runtime:
-  skip_template_build: false
+  skip_template_build: true
 
   # 每个 query 最多比对几个非本人 identity；0 表示全量 impostor。
   max_impostor_identities_per_query: 0
@@ -27,17 +27,21 @@ runtime:
   limit_images_per_identity: 0
 
 data:
-  # 默认 metadata。当前项目中 sample_index.csv 字段通常为：
-  #   finger_id / image_id / image_path
-  # 代码会自动把 finger_id 归一化为 identity_id。
-  metadata_csv: ../outputs/ysjz_V4/sample_index.csv
+  # 原始指纹图像根目录。匹配任务会直接扫描原图，不依赖 pair_build 产物。
+  image_root: ../datasets/Quant_tiny_V1_4
 
-  # 当 metadata_csv 不存在或未指定时，备用扫描图像根目录。
-  image_root: ../pair_build/ysjz_V4
+  # 相对 image_root 的前几级目录共同组成一个手指的 identity_id。
+  # 当前目录形如 dy_L0/pair_1.bmp，因此使用前 1 级。
+  identity_depth: 1
+
+  image_extensions: [.bmp, .png, .jpg, .jpeg, .tif, .tiff]
+
+  # 启动时检查所有输入图像是否能够正常解码。
+  validate_readable: true
 
 model:
   # 默认 HardNet checkpoint。相对路径相对本配置文件所在目录解析。
-  checkpoint: ../outputs/hardnet_train_post_nips_lr10/best.pt
+  checkpoint: ../outputs/models/hardnet_train_post_nips_lr10/best.pt
 
   # 以下结构参数必须和训练时 HardNet 模型保持一致。
   dropout: 0.3

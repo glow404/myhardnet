@@ -25,13 +25,10 @@ if str(ROOT) not in sys.path:
 
 from val_new.core import HardNetDescriptor, build_sift, detect_sift_keypoints, imread_grayscale, patchable_keypoints
 
-from .utils import ensure_dir, read_csv_rows, resolve_path, template_filename, write_csv_rows, write_json
+from .utils import ensure_dir, template_filename, write_csv_rows, write_json
 
 
 LOGGER = logging.getLogger(__name__)
-IMAGE_EXTENSIONS = {".bmp", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
-
-
 def detect_keypoints_only(image: np.ndarray, config: dict[str, Any], sift: cv2.SIFT) -> list[cv2.KeyPoint]:
     """HardNet 模板构建用：只检测关键点，不计算 SIFT 描述子。"""
 
@@ -60,63 +57,6 @@ def extract_keypoint_patches(
             }
         },
     )
-
-
-def normalize_metadata_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
-    """把 metadata 归一化为 identity_id/image_id/image_path/split 字段。"""
-
-    normalized: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for row in rows:
-        identity_id = row.get("identity_id") or row.get("finger_id")
-        image_id = row.get("image_id") or Path(row.get("image_path", "")).stem
-        image_path = row.get("image_path")
-        if not identity_id or not image_id or not image_path:
-            continue
-        key = (str(identity_id), str(image_id))
-        if key in seen:
-            continue
-        seen.add(key)
-        normalized.append(
-            {
-                "identity_id": str(identity_id),
-                "image_id": str(image_id),
-                "image_path": str(image_path),
-                "split": str(row.get("split", "")),
-            }
-        )
-    return normalized
-
-
-def scan_image_metadata(image_root: str | Path, identity_depth: int = 3) -> list[dict[str, str]]:
-    """从图像目录扫描 metadata。"""
-
-    root = Path(image_root).expanduser()
-    rows: list[dict[str, str]] = []
-    for path in sorted(root.rglob("*")):
-        if path.suffix.lower() not in IMAGE_EXTENSIONS:
-            continue
-        rel = path.relative_to(root)
-        if len(rel.parts) <= identity_depth:
-            continue
-        identity_id = "/".join(rel.parts[:identity_depth])
-        rows.append({"identity_id": identity_id, "image_id": path.stem, "image_path": str(path), "split": ""})
-    return rows
-
-
-def load_or_build_metadata(config: dict[str, Any], metadata_path: str | Path | None) -> list[dict[str, str]]:
-    """优先读取 metadata CSV；没有 CSV 时退回扫描图像目录。"""
-
-    if metadata_path:
-        return normalize_metadata_rows(read_csv_rows(metadata_path))
-    data_cfg = dict(config.get("data", {}))
-    configured = data_cfg.get("metadata_csv")
-    if configured:
-        path = resolve_path(config, configured)
-        if path.exists():
-            return normalize_metadata_rows(read_csv_rows(path))
-    image_root = resolve_path(config, data_cfg.get("image_root", "../pair_build/data"))
-    return scan_image_metadata(image_root)
 
 
 def save_hardnet_template(
