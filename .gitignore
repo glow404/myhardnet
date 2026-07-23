@@ -1,0 +1,79 @@
+# Python/runtime caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments and local machine state
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Datasets, generated experiment outputs, and visualizations
+pair_build/select/
+pair_build/data/
+pair_build/patches/
+pair_build/tiny*/
+pair_build/ysjz*/
+pair_build/*denoised*/
+match_new/outputs*/
+match_new/save/
+match_new/hardnet_inlier_visuals/
+match_new/*/
+!match_new/tests/
+!match_new/tests/**
+val/outputs*/
+val_new/outputs*/
+
+# Intermediate binary artifacts
+*.npz
+*.npy
+
+# Fingerprint image/data files
+*.bmp
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.csv
+*.pdf
+*.zip
+.DS_Store
+
+# Local/editor noise
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
+
+# Keep source, docs, and configuration files tracked.
+!*.py
+!*.md
+!*.yaml
+!*.yml
+!*.json
+!*.toml
+!*.ini
+!*.cfg
+!*.cpp
+!*.c
+!*.h
+!*.hpp
+!CMakeLists.txt
+
+# Keep test source files, but not test caches.
+match_new/tests/__pycache__/
+
+# Keep trained model checkpoints in outputs/, but ignore other generated output files.
+outputs/**
+!outputs/
+!outputs/**/
+!outputs/**/*.pt
+!outputs/**/*.pth
+!outputs/**/*.ckpt
+!outputs/**/*.onnx

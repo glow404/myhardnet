@@ -1,0 +1,56 @@
+# HardNet 高 dropout / 较大学习率训练配置。
+# 训练命令python -m hardnet_train.train --config hardnet_train/config.yaml
+# 论文原文 3.2 节提到：在 PyTorch 版本更新后，作者重新搜索超参，
+# 发现把学习率提高到 10、dropout 提高到 0.3 能恢复/提升结果。
+# 当前项目中改用 warmup + cosine decay，避免线性衰减在模型仍改善时直接降到 0。
+
+seed: 42
+output_dir: ../outputs/hardnet_train_fingers_hard3
+
+data:
+  train_csv: ../outputs/hardnet_dataset/train_pairs.csv
+  val_csv: ../outputs/hardnet_dataset/val_pairs.csv
+  test_csv: ../outputs/hardnet_dataset/test_pairs.csv
+  normalize: true
+  num_workers: 0
+  pin_memory: false
+  max_train_rows:
+  max_val_rows:
+  max_train_rows_per_finger:
+  max_val_rows_per_finger:
+
+model:
+  dropout: 0.3   # 作用：随机丢弃部分特征，防止过拟合。推理时不生效
+  final_bn_affine: false  #作用：控制最后一层批归一化（BatchNorm）是否学习缩放和平移参数。
+
+training:
+  device: auto
+  # 指纹数据比 Brown patch 更难，最大训练 100 epoch，并支持从 last.pt 续训。
+  epochs: 500
+  steps_per_epoch: 1000
+  val_steps: 200
+  # 单手指点数不足会从已选样本重复采样补齐；整个 batch 仍不足则丢弃。伪负样本由 point_group 屏蔽。
+  batch_size: 256
+  # fingers_per_batch=1 时，每 batch 只选 1 根手指，全部 256 对来自同一手指的一个两图组合。
+  fingers_per_batch: 32
+  # Hard negative mining strategy:
+  # - same_finger_allowed: allow same-finger negatives, but mask connected point_group.
+  # - different_finger: only use negatives from different finger_id values.
+  hard_negative_strategy: same_finger_allowed
+  # 每条正样本从双向合法候选中选择距离最小的 k 个负样本；设为 1 可复现原来的 hardest-negative。
+  hard_negative_top_k: 3
+  # 论文 margin 是 1.0；当前指纹 patch 先保留较温和的 0.8。
+  margin: 1.0
+  # 长训练先禁用早停；需要时可命令行设置 --early-stop-patience。
+  early_stop_patience: 0
+  early_stop_min_relative_improvement: 0.002
+  scheduler: warmup_cosine
+  warmup_epochs: 2
+  eta_min: 0.0001
+  log_interval: 50
+
+optimizer:
+  # 这里显式使用 3.0；如需复现实验中的 lr=10，可直接把此处改为 10.0。
+  lr: 10.0
+  momentum: 0.9
+  weight_decay: 0.0001

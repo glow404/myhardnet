@@ -1,0 +1,14 @@
+负样本采样策略
+| 策略 | 可以作为负样本 | 被屏蔽 |
+|---|---|---|
+| `different_finger` | 不同 `finger_id` 的 patch | 正样本、同一 `point_group`、同一手指全部 patch |
+| `same_finger_allowed` | 不同手指，以及同一手指不同 `point_group` | 正样本、同一 `point_group` |
+
+对于same_finger_allowed策略，需要考虑伪负样本情况：
+目前已完成：使用 union-find，把跨图连通的真实对应点合并为同一 point_group。
+sampler 每根手指每个 batch 只选择一个 image_pair_id，并尽量不重复 point_group。
+最难负样本已改为可配置的 top-k 难负样本，默认 k=3；k=1 可复现原行为。
+ps：同一像素位置附近输出多个关键点，只是方向不同。
+
+可做：
+1.验证指标固定为随机负样本对。

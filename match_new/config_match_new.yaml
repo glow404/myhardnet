@@ -1,0 +1,261 @@
+# match_new 正式实验配置
+#
+# 这个配置对应一套“更适配 HardNet 连续描述子”的手机解锁式指纹验证实验：
+#   1. 每个 identity 随机选 20 张图作为注册模板；
+#   2. 其余图作为 query；
+#   3. query 分别对本人模板库和所有非本人模板库打 identity 级分数；
+#   4. 使用 HardNet L2/top-k/RANSAC/脊线纹理融合 match score 输出 FAR、FRR、EER 和推荐阈值；
+#   5. 在目标阈值下导出 false reject / false accept 原图，方便人工排查失败原因。
+
+# ---------------------------------------------------------------------------   
+output:
+  # 实验结果根目录。相对路径相对本配置文件所在目录解析。
+  # 其下会生成 image_templates/、eval_hardnet_l2/、各类 CSV/JSON 等。
+  output_dir: ysjz_V4
+
+runtime:
+  skip_template_build: false
+
+  # 每个 query 最多比对几个非本人 identity；0 表示全量 impostor。
+  max_impostor_identities_per_query: 0
+
+  # 调试裁剪：只保留前 N 个 identity；0 表示不限制。正式实验必须为 0。
+  limit_identities: 0
+
+  # 调试裁剪：每个 identity 最多保留 N 张图；0 表示不限制。正式实验必须为 0。
+  # 例如设为 22，配合 enrollment_images_per_identity=20，可形成 20 注册 + 2 query。
+  limit_images_per_identity: 0
+
+data:
+  # 默认 metadata。当前项目中 sample_index.csv 字段通常为：
+  #   finger_id / image_id / image_path
+  # 代码会自动把 finger_id 归一化为 identity_id。
+  metadata_csv: ../outputs/ysjz_V4/sample_index.csv
+
+  # 当 metadata_csv 不存在或未指定时，备用扫描图像根目录。
+  image_root: ../pair_build/ysjz_V4
+
+model:
+  # 默认 HardNet checkpoint。相对路径相对本配置文件所在目录解析。
+  checkpoint: ../outputs/hardnet_train_post_nips_lr10/best.pt
+
+  # 以下结构参数必须和训练时 HardNet 模型保持一致。
+  dropout: 0.3
+  final_bn_affine: false
+
+  # auto 表示优先 cuda，否则 cpu。
+  device: auto
+
+  # 建模版时，HardNet patch 一次批量推理 batch size个patch。
+  batch_size: 512
+
+sift:
+  # SIFT 在 HardNet 主实验中只负责提供关键点位置和方向；
+  nfeatures: 500    #每层最多检测的关键点数。越大检测越密集
+  nOctaveLayers: 3   #尺度层数。越大尺度采样越细，关键点更多
+  contrastThreshold: 0.03  #对比度阈值，低于此值的点不作为关键点。越小越容易保留弱纹理 0.02-0.04
+  edgeThreshold: 17.5  #边缘响应阈值，避免检测到边缘点，越大越容易保留边缘点 10-14
+  sigma: 1.70  #第一层尺度空间的高斯模糊强度。影响关键点主要在哪个尺度上被检测到。 1.5-1.7
+
+  # 与前面 match/val 实验保持一致的图像预处理。
+  enable_clahe: false
+  clahe_clip: 4.0
+  clahe_tile: [8, 8]
+  enable_blur: false
+  blur_sigma: 0.8
+
+patch:
+  # 重要：这里和 pair_build/config.yaml 对齐，当前训练 patch 是直接裁 32x32，
+  crop_size: 32
+  out_size: 32
+
+  # 单 patch 标准化：减自身均值、除自身标准差。
+  normalize: true
+
+  # keypoint 靠近边界时，如果裁剪窗口与原图有效重叠过低，就丢弃该点。
+  min_overlap_ratio: 0.75
+
+keypoint_filter:
+  # 每张图最多保留的 SIFT keypoints 数，按 response 从高到低截断。
+  max_keypoints: 500
+
+matching:
+  # 主实验只使用 HardNet 连续 descriptor。
+  descriptor_source: hardnet
+
+  # 使用 L2 距离。HardNet 输出已 L2 normalize 时，L2 排序和 cosine 排序等价。
+  distance: l2
+
+  # 候选生成策略：
+  #   ratio_only     : 只保留通过 Lowe ratio 的最近邻；
+  #   topk_only      : 保留 top-k 中距离足够近的候选；
+  #   topk_or_ratio  : 通过 ratio 则保留最近邻，否则退回 top-k 自适应阈值。
+  candidate_policy: ratio_only
+
+  # 每个 query keypoint 最多向 gallery 取几个近邻候选。
+  top_k: 1
+
+  # HardNet L2 的 Lowe ratio 阈值。比 SIFT/Hamming 方案更宽松。
+  ratio_threshold: 0.85
+
+  # 是否启用双向 Lowe 比值验证。
+  # 仅影响 ratio_only 和 topk_or_ratio 的 ratio 分支；topk_only 不使用该参数。
+  bidirectional_ratio_test: true
+
+  # 绝对距离上限。最近邻距离仍必须不超过该值
+  abs_distance_threshold: 1.5
+
+  # 自适应距离上限：nearest_distance + distance_margin。topk只才有用。
+  # 实际上限取 min(abs_distance_threshold, nearest + margin)。
+  distance_margin: 0.15
+
+  # RANSAC 前允许一对多候选，避免局部纹理重复时过早删掉真匹配；
+  # RANSAC 后再做 one-to-one 去重。  开启双向验证时，这个参数不起作用。
+  allow_many_to_one_before_ransac: false
+
+  # 候选过多会拖慢 RANSAC，也容易引入噪声，所以进入 RANSAC 前截断。
+  max_candidates_for_ransac: 300
+
+  # 方向只做软排序，不做 SIFT 式方向峰硬过滤。
+  orientation_soft_gate: false
+  orientation_weight: 0.15
+  orientation_hist_bin_deg: 10.0
+  orientation_consistency_thresh_deg: 20.0
+
+  # one-to-one 去重时的排序分数：
+  #   hardnet_l2_distance + reproj_error_weight * reprojection_error
+  reproj_error_weight: 0.05
+
+  # RANSAC 几何验证参数。使用 estimateAffinePartial2D，适合局部旋转/缩放/平移。
+  ransac_reproj_threshold: 0.5  
+  ransac_max_iters: 3000
+  ransac_confidence: 0.995
+
+  # 指纹图像主要是平移/旋转，只有极少量尺度变化。
+  # RANSAC 得到 partial affine 后，只约束 scale，不限制旋转角。
+  min_scale: 0.90
+  max_scale: 1.10
+
+texture_verification:
+  # C 方案：先用几何内点保证仿射可用，再融合几何分数和局部脊线纹理分数。
+  # 启用后模板必须含 overlap_image；首次运行需重新构建模板，不能复用旧版模板。
+  enabled: true
+
+  # 低于该内点数不信任仿射矩阵，直接拒绝且不计算纹理。
+  low_unique_inliers: 3
+
+  # geometry_similarity = clip(unique_inliers / geometry_saturation_inliers, 0, 1)。
+  geometry_saturation_inliers: 12.0
+
+  # match score = 0.70 * geometry_similarity + 0.30 * texture_similarity。
+  # 代码会自动按两者之和归一化权重。
+  geometry_weight: 0.70
+  texture_weight: 0.30
+
+  # 局部 ZNCC 参数。分数是有效块正相关系数的中位数，范围 [0,1]。
+  block_size: 16
+  blur_sigma: 0.8
+  min_block_std: 5.0
+  min_block_valid_fraction: 0.60
+  min_valid_blocks: 4
+  min_overlap_fraction: 0.20
+
+enrollment:
+  # 每个手指随机选多少张图作为模板库。
+  enrollment_images_per_identity: 20
+  selection_strategy: random
+
+  # 注册/query 划分随机种子。固定后多次实验可复现。
+  random_seed: 42
+
+template_management:
+  # 动态模板库总开关。初始20张注册模板全部作为受保护seed，之后只学习HardNet模板。
+  enabled: true
+
+  # 在当前FAR/FRR数据流中按query顺序执行在线学习。关闭后只运行原有静态评估。
+  apply_during_evaluation: true
+
+  # true保证每次实验从同一批20张初始模板开始，便于重复对比。
+  # 实际长期在线运行时应改为false，继续读取上次保存的template_library.json。
+  reset_library_on_start: true
+
+  # 初始20张模板全部受保护；模板库最多再容纳20张学习模板。
+  max_active_templates: 40
+  protected_seed_templates: 20
+
+  # 身份可信：至少一张模板满足严格学习条件，同时至少两张可信模板完成确认，
+  # 并且确认模板中至少包含一张初始seed。
+  learn_score_threshold: 0.85
+  learn_min_unique_inliers: 12
+  learn_min_texture_similarity: 0.75
+  confirm_score_threshold: 0.70
+  confirmation_templates: 2
+  require_seed_confirmation: true
+
+  # 使用局部灰度标准差生成真实脊线纹理coverage mask，再计算仿射对齐公共区域。
+  min_common_area_ratio: 0.35
+  min_common_area_pixels: 256
+  coverage_window_size: 9
+  coverage_min_std: 5.0
+  coverage_morph_kernel: 3
+
+  # 动态索引、学习模板和被替换模板都写入本次output根目录。
+  library_filename: template_library.json
+  learned_templates_dir: learned_templates
+  retired_templates_dir: retired_templates
+
+  # Windows可能因杀毒软件、文件索引器等短暂占用JSON。原子替换失败时按退避间隔重试；
+  # 重试后仍失败则保留template_library.json.pending，并在后续写入或下次启动时恢复。
+  persist_replace_retries: 20
+  persist_retry_delay_ms: 100
+  persist_strict: false
+
+identification:
+  #   max       : 注册模板里取最高图像级分数，符合手机解锁“命中一张即可”的语义；
+  #   top3_mean : 可用于消融，更保守。
+  fusion_method: max
+
+  # [0,1] 连续匹配分数阈值，不再表示 unique inlier 数。
+  # 当前 0.55 是首轮值，正式推荐看 target_operating_point 后重新标定。
+  match_score_threshold: 0.55
+
+  # 解锁式匹配加速：当某张注册模板的图像级 score 已经达到解锁阈值时，
+  # 立即返回该 identity 的结果，不再继续匹配剩余注册模板。
+  # 只对 max / max_quality_tiebreak 融合方式启用；mean / top3_mean 会自动关闭。
+  early_stop_on_unlock_threshold: true
+
+  # 为空/null 时默认使用 match_score_threshold。若要用其他线上解锁阈值，可在这里单独设置。
+  early_stop_threshold:
+
+evaluation:
+  # 正式手机解锁目标：FAR < 1/50000，FRR < 2%。
+  target_far: 0.00002
+  target_frr: 0.02
+
+  # 正式 FAR/FRR 需要每个 identity 的完整最高分。若提前停止在 0.55，
+  # 则 0.55 以上的阈值曲线会被截断，因此阈值扫描默认临时关闭提前停止。
+  # identification 中的提前停止配置仍保留给实际在线解锁使用。
+  disable_early_stop_for_threshold_sweep: true
+
+  # 额外报告 TAR/FRR@FAR 的点。
+  far_points: [0.001, 0.0001, 0.00002]
+
+  # true 表示除手写阈值外，按 score_threshold_step 补齐 [0,1] 连续分数阈值。
+  auto_thresholds: true
+  score_threshold_step: 0.01
+
+  # 固定匹配分数阈值列表，用于横向对比实验。
+  score_thresholds: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.55, 0.6, 0.7, 0.8, 0.9, 1.0]
+
+  failure_export:
+    # 在 target_operating_point 阈值下导出失败样本。
+    enabled: true
+
+    # 每类最多导出多少个 case。全量实验失败样本很多时，避免目录过大。
+    max_cases_per_type: 200
+
+    # 是否把 query 原图和最佳命中的模板原图复制到 case 目录。
+    copy_original_images: true
+
+    # 是否生成左右拼接 preview 图。
+    make_pair_preview: true

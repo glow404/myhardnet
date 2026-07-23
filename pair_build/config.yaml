@@ -1,0 +1,197 @@
+# HardNet 指纹正样本数据集构建配置。
+#
+# 这个配置文件控制 pair_build 下的完整数据构建流水线：
+#   index -> split -> build_positive -> extract_patches -> qa
+#
+# 当前版本不依赖 NPZ 模板文件，而是直接从 pair_build/data 下的小局部指纹原图中：
+#   1. 提取 SIFT keypoints/descriptors
+#   2. 对同一 finger_id 内的两张图做 SIFT 匹配和 RANSAC 几何验证
+#   3. 使用几何矩阵 T 做正样本扩展
+#   4. 裁剪 HardNet 训练需要的 32x32 正样本 patch 对
+#
+# 说明：
+# - 所有相对路径都相对于本配置文件所在目录 pair_build/ 解析。
+# - 调参时建议一次只改一两个字段，然后重新跑 build_positive/extract_patches/qa 观察 QA。
+# - 如果要完整重建，运行：
+#     python pair_build/main.py --config pair_build/config.yaml --stage all
+
+# 路径相关配置。
+paths:
+  # 原始小局部指纹图像根目录。目录层级默认形如：
+  #   data/butieping/fys_R0/Rgd1237/xxx_pair0.bmp
+  data_root: ysjz_V4
+  # 输出目录。会写入 sample_index.csv、split_assignments.csv、
+  # all_positive_pairs.csv、patches/、QA 报告等产物。
+  output_root: ../outputs/ysjz_V4
+
+# 日志相关配置。
+logging:
+  # 常用值：DEBUG / INFO / WARNING / ERROR。
+  # DEBUG 会输出更多细节，但全量构建时日志会比较大。
+  level: INFO
+  logger_name: hardnet_dataset
+
+# 原图索引阶段配置。
+index:
+  # finger_id 从相对路径前几级目录拼出来。
+  # 当前数据用前三层表示一个手指/采集条件，例如：
+  #   butieping/fys_R0/Rgd1237
+  finger_id_depth: 3
+
+  # 允许扫描进数据集的图片后缀。大小写不敏感。
+  image_extensions:
+    - .bmp
+    - .png
+    - .jpg
+    - .jpeg
+    - .tif
+    - .tiff
+
+# 数据划分配置。
+split:
+  # 按 finger_id 粒度划分，保证同一个 finger_id 不会同时出现在 train/val/test。
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+
+  # 固定随机种子，保证多次划分可复现。
+  random_seed: 42
+
+# SIFT 特征提取配置。
+# 这些默认值参考 finger/finger/include/SiftConfig.h 中当前指纹 SIFT 参数。
+sift:
+  # 每张小图最多保留的 SIFT 关键点数量。小图约 100x110，500 通常足够。
+  nfeatures: 500
+
+  # DoG 金字塔每个 octave 的层数。增大可增加尺度采样密度，但会变慢。
+  nOctaveLayers: 3
+
+  # 对比度阈值。降低会保留更多弱纹理点，升高会更严格。
+  contrastThreshold: 0.03
+
+  # 边缘响应阈值。对指纹脊线来说适当放宽可保留更多沿脊线结构点。
+  edgeThreshold: 17.5
+
+  # 初始高斯模糊。这里贴近已有 finger 工程参数。
+  sigma: 1.70
+
+  # 是否把 SIFT descriptor 转为 RootSIFT。
+  # RootSIFT 通常能改善 L2 匹配稳定性。
+  enable_rootsift: true
+
+  # 是否在提特征前做 CLAHE 对比度增强。
+  enable_clahe: false
+  clahe_clip: 4.0
+  clahe_tile: [8, 8]
+
+  # 是否做轻微高斯模糊，降低采集噪声对关键点和方向的影响。
+  enable_blur: false
+  blur_sigma: 0.8
+
+# 正样本构建与几何扩展配置。
+matching:
+  # 图像配对策略。当前实现使用同一 finger_id 内全部两两组合。
+  pairing_strategy: all_combinations
+
+  # descriptor matcher。当前 RootSIFT/SIFT 使用 L2 BFMatcher。
+  matcher_backend: bf
+
+  # Lowe ratio test 阈值。越小越严格、seed matches 更少但更干净。
+  ratio_thresh: 0.85
+
+  # 是否要求双向最近邻一致。false 更接近当前 finger 工程里追求匹配数量的设定。
+  strict_two_way: true
+
+  # RANSAC 几何模型。partial_affine 对小局部图更稳，包含旋转/平移/尺度/有限剪切。
+  ransac_model: partial_affine
+
+  # RANSAC 重投影阈值，单位像素。越小几何越严格。
+  ransac_reproj_thresh: 0.5
+
+  # 执行 RANSAC 前至少需要的 seed matches。
+  min_seed_matches: 3
+
+  # 一对图像至少要有多少 RANSAC 内点，才认为几何关系可信。
+  min_inliers_per_image_pair: 8
+
+  # 每个 image_pair 最多导出多少个正样本 correspondence。
+  # 这也是后续 batch sampler 中每个 image_pair 的天然上限 K。
+  max_positive_per_image_pair: 16
+
+  # 是否启用几何引导正样本扩展。
+  # false 时只保留 RANSAC seed inliers。
+  enable_geometry_expansion: true
+
+  # 最终选择时，尽量保留的 geometry_expanded 最小数量。
+  # 如果扩展样本质量不够或数量不足，会自然少于该值。
+  min_geometry_expanded_per_image_pair: 0
+
+  # 几何扩展第一道门槛：kp_a 经 T 投影到 B 后，
+  # 只在这个半径内寻找 B 图 keypoint 候选。
+  projection_radius: 0.5
+
+  # 几何扩展方向一致性阈值。（没有考虑180°二义性问题）
+  # kp_b.angle 应接近 kp_a.angle + T 的整体旋转角。
+  angle_thresh_deg: 30.0
+
+  # 几何扩展尺度一致性阈值。
+  # scale_ratio = kp_b.size / (kp_a.size * transform_scale)。
+  scale_ratio_min: 0.80
+  scale_ratio_max: 1.20
+
+  # keypoint 距离图像边界至少多少像素，避免 patch 裁剪严重越界。
+  # 当前直接裁 32x32 patch，理论半径为 16 px，因此这里设为 16。
+  border_margin: 16
+
+  # 纹理质量窗口半径和最小标准差。
+  # 标准差太低的 patch 往往是空白/弱纹理，不适合训练 descriptor。
+  texture_window_radius: 10
+  min_texture_std: 5.0
+
+  # 图像对内部去重距离。
+  # 同侧关键点距离过近时，只保留 stability_score 更高的样本，降低伪负样本风险。
+  dedup_min_distance: 8.0
+
+  # 下面三个 scale 用于把误差型指标转成 [0, 1] 分数。
+  # scale 越小，对该误差越敏感。
+  descriptor_distance_scale: 0.7
+  reproj_error_scale: 5.0
+  angle_error_scale: 30.0
+
+  # stability_score 的线性加权项。
+  # source_seed 给 SIFT/RANSAC 内点一个小加分；
+  # geometry_expanded 没有该加分，但若几何/方向/纹理足够好仍可入选。
+  score_weights:
+    source_seed: 0.08
+    descriptor: 0.22
+    reproj: 0.24
+    angle: 0.18
+    scale: 0.10
+    response: 0.08
+    texture: 0.10
+
+# patch 裁剪与过滤配置。
+patch:
+  # 直接在原图中裁 32x32，输出仍为 32x32，贴合原版 HardNet 输入。
+  # 这样避免 64->32 压缩，同时降低靠边裁剪产生黑边的概率。
+  patch_crop_size: 32
+  patch_out_size: 32
+
+  # 裁剪框与原图有效重叠比例下限。过低说明越界严重。
+  min_overlap_ratio: 0.80
+
+  # 空白像素阈值，以及允许的最大空白比例。
+  blank_threshold: 8
+  max_blank_ratio: 0.10
+
+  # patch 的最小灰度标准差和有效像素比例。
+  min_patch_std: 5.0
+  min_valid_ratio: 0.35
+
+# QA 报告与可视化配置。
+qa:
+  # 生成多少张原图匹配连线预览。
+  match_preview_count: 10
+
+  # patch 预览网格中展示多少对 patch。
+  patch_preview_count: 16
