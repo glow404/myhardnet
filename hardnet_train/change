@@ -1,0 +1,15 @@
+训练侧新增：
+CUDA 强制检查，避免静默退回 CPU。
+FP16 autocast 和 GradScaler。
+CNN 前向使用 FP16，难负样本距离矩阵与 loss 保持 FP32。
+AMP scaler 状态随 checkpoint 保存和恢复。
+channels_last、cuDNN benchmark 和 TF32。
+4 个常驻 DataLoader worker、锁页内存和数据预取。
+推理侧新增：
+torch.inference_mode()。
+FP16/BF16/FP32 可配置推理。
+channels-last 模型和输入。
+锁页内存及异步 CPU→GPU 传输。
+多个推理 batch 在 GPU 合并后只回传一次。
+在线基准结果记录实际设备和推理精度。
+

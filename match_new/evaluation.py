@@ -7,7 +7,7 @@
     2. 同一个 query 对所有非本人 identity 的 20 张注册模板打分，得到 impostor attempts；
     3. identity 级分数默认取 20 张模板中的最大图像级 score；
     4. 根据 identity 级 score 计算 FAR、FRR、EER、AUC、TAR@FAR；
-    5. 按目标约束 FAR < 1/50000、FRR < 2% 选择 target_operating_point；
+    5. 按目标约束 FAR < 1/50000、FRR < 2% 选择 target_operating_point； todo：这个可以去掉了
     6. 在该阈值下导出 false reject / false accept 原图和拼接预览图。
 
 注意：
@@ -31,9 +31,8 @@ import numpy as np
 from sklearn.metrics import auc, roc_curve
 from tqdm import tqdm
 
-from match_new.hardnet_matcher import match_templates_descriptor_l2
-from match_new.template_library import TemplateLibraryManager
-from match_new.template_builder import load_identity_templates, load_image_template
+from match_new.identity_matcher import load_template_cached, score_query_against_identity
+from match_new.template_builder import load_identity_templates
 from match_new.utils import ensure_dir, read_csv_rows, resolve_path, safe_id, template_filename, write_csv_rows, write_json, write_yaml
 
 
@@ -80,6 +79,19 @@ SCORE_FIELDNAMES = [
     "geometry_weight",
     "texture_weight",
     "texture_decision",
+    "registered_template_load_ms",
+    "descriptor_prepare_ms",
+    "candidate_generation_ms",
+    "candidate_filter_ms",
+    "ransac_ms",
+    "inlier_refinement_ms",
+    "texture_similarity_ms",
+    "score_fusion_ms",
+    "postprocess_ms",
+    "image_match_total_ms",
+    "identity_fusion_ms",
+    "identity_match_overhead_ms",
+    "identity_match_total_ms",
     "attempt_match_ms",
     "query_template_build_ms",
     "unlock_match_ms",
@@ -88,7 +100,7 @@ SCORE_FIELDNAMES = [
 
 
 def parse_float(value: Any) -> float | None:
-    """Parse a timing value written as CSV text."""
+    """解析 CSV 文本形式的耗时值；空值或非法值返回 ``None``。"""
 
     try:
         if value in {"", None}:
@@ -99,7 +111,7 @@ def parse_float(value: Any) -> float | None:
 
 
 def timing_percentile(values: list[float], q: float) -> float | None:
-    """Nearest-rank percentile for timing reports."""
+    """用最近秩方式计算耗时报告中的百分位数。"""
 
     if not values:
         return None
@@ -110,7 +122,7 @@ def timing_percentile(values: list[float], q: float) -> float | None:
 
 
 def summarize_timing(values: list[float]) -> dict[str, Any]:
-    """Summarize millisecond timings."""
+    """汇总一组毫秒耗时，输出最快、平均、最慢及 P50/P95。"""
 
     if not values:
         return {"count": 0}
@@ -177,156 +189,10 @@ def summarize_score_components(score_rows: list[dict[str, str]], threshold: floa
     }
 
 
-def load_template_cached(
-    path: str | Path,
-    cache: dict[str, dict[str, Any]],
-    *,
-    require: str | None = None,
-) -> dict[str, Any]:
-    """读取 `.npz` 模板并缓存。
-
-    全量实验中同一张注册模板会被大量 query 反复访问，缓存可以显著减少磁盘 IO。
-    """
-
-    key = str(Path(path).expanduser())
-    cache_key = f"{key}::{require or 'any'}"
-    if cache_key not in cache:
-        cache[cache_key] = load_image_template(key, require=require)
-    return cache[cache_key]
-
-
 def select_query_rows(metadata_rows: list[dict[str, str]]) -> list[dict[str, str]]:
     """从 split metadata 中取出 query 图像行。"""
 
     return [row for row in metadata_rows if str(row.get("split", "")).lower() == "query"]
-
-
-def fuse_image_results(results: list[dict[str, Any]], method: str) -> float:
-    """把 query 与 20 张注册模板的图像级分数融合成 identity 级分数。
-
-    默认 `max` 对应手机解锁语义：20 张注册模板里只要有一张稳定命中即可解锁。
-    """
-
-    if not results:
-        return 0.0
-    scores = np.asarray([float(item.get("score", 0.0)) for item in results], dtype=np.float32)
-    method = str(method).lower()
-    if method == "max":
-        return float(np.max(scores))
-    if method == "mean":
-        return float(np.mean(scores))
-    if method == "top3_mean":
-        top = np.sort(scores)[-min(3, scores.size) :]
-        return float(np.mean(top)) if top.size else 0.0
-    if method == "max_quality_tiebreak":
-        best = max(results, key=lambda item: (float(item.get("score", 0.0)), float(item.get("quality_score", 0.0))))
-        return float(best.get("score", 0.0))
-    raise ValueError(f"unsupported fusion method: {method}")
-
-
-def unlock_early_stop_threshold(config: dict[str, Any], fusion_method: str) -> float | None:
-    """读取解锁提前停止阈值。
-
-    提前停止只适合 `max` 类融合：只要某张注册模板达到解锁阈值，后续模板不会改变
-    “当前阈值下是否接受”的结论。对 `mean` / `top3_mean` 这类需要完整模板集合的融合，
-    提前停止会改变分数定义，因此自动关闭。
-    """
-
-    identification = dict(config.get("identification", {}))
-    if not bool(identification.get("early_stop_on_unlock_threshold", False)):
-        return None
-    if str(fusion_method).lower() not in {"max", "max_quality_tiebreak"}:
-        return None
-    threshold = identification.get("early_stop_threshold")
-    if threshold in {"", None}:
-        threshold = identification.get("match_score_threshold", 0.55)
-    threshold = float(threshold)
-    if not 0.0 <= threshold <= 1.0:
-        raise ValueError(f"identification early-stop match score threshold must be in [0,1], got {threshold}")
-    return threshold
-
-
-def score_query_against_identity(
-    query_template: dict[str, Any],
-    identity: dict[str, Any],
-    config: dict[str, Any],
-    template_cache: dict[str, dict[str, Any]],
-    descriptor_source: str = "hardnet",
-) -> dict[str, Any]:
-    """计算一个 query 对一个 identity 模板库的 identity 级分数。
-
-    一个 identity 通常有 20 张注册模板。本函数逐张调用图像级 matcher，
-    然后按配置融合分数，并记录最佳命中模板，方便后续失败样本可视化。
-    """
-
-    paths = [str(path) for path in identity.get("template_paths", [])]
-    method = str(dict(config.get("identification", {})).get("fusion_method", "max"))
-    early_stop_threshold = unlock_early_stop_threshold(config, method)
-    require = "sift" if str(descriptor_source).lower() in {"sift", "rootsift"} else "hardnet"
-
-    results: list[dict[str, Any]] = []
-    best_index = -1
-    early_stopped = False
-    for index, path in enumerate(paths):
-        result = match_templates_descriptor_l2(
-            query_template,
-            load_template_cached(path, template_cache, require=require),
-            config,
-            descriptor_source=descriptor_source,
-        )
-        results.append(result)
-        score = float(result.get("score", 0.0))
-        quality = float(result.get("quality_score", 0.0))
-        if best_index < 0:
-            best_index = index
-        else:
-            best = results[best_index]
-            best_key = (float(best.get("score", 0.0)), float(best.get("quality_score", 0.0)))
-            if (score, quality) > best_key:
-                best_index = index
-        if early_stop_threshold is not None and score >= early_stop_threshold:
-            early_stopped = True
-            break
-
-    if results:
-        best_index = max(range(len(results)), key=lambda idx: (float(results[idx].get("score", 0.0)), float(results[idx].get("quality_score", 0.0))))
-    best = results[best_index] if best_index >= 0 else {}
-    best_template = load_template_cached(paths[best_index], template_cache, require=require) if best_index >= 0 else {}
-    return {
-        "score": float(fuse_image_results(results, method)),
-        "best_template_path": paths[best_index] if best_index >= 0 else "",
-        "best_template_image_id": str(best_template.get("image_id", "")),
-        "best_template_image_path": str(best_template.get("image_path", "")),
-        "num_templates": len(paths),
-        "num_templates_evaluated": len(results),
-        "early_stopped": int(early_stopped),
-        "early_stop_threshold": "" if early_stop_threshold is None else float(early_stop_threshold),
-        "best_image_score": float(best.get("score", 0.0)),
-        "best_quality_score": float(best.get("quality_score", 0.0)),
-        "num_raw_matches": int(best.get("num_raw_matches", 0)),
-        "num_candidates": int(best.get("num_candidates", 0)),
-        "num_inliers": int(best.get("num_inliers", 0)),
-        "raw_inliers": int(best.get("raw_inliers", 0)),
-        "unique_inliers": int(best.get("unique_inliers", 0)),
-        "unique_query_inliers": int(best.get("unique_query_inliers", 0)),
-        "unique_gallery_inliers": int(best.get("unique_gallery_inliers", 0)),
-        "inlier_ratio": float(best.get("inlier_ratio", 0.0)),
-        "mean_l2_distance": float(best.get("mean_l2_distance", 0.0)),
-        "mean_reproj_error": float(best.get("mean_reproj_error", 0.0)),
-        "orientation_consistency": float(best.get("orientation_consistency", 0.0)),
-        "dominant_angle_delta": float(best.get("dominant_angle_delta", 0.0)),
-        "mean_similarity": float(best.get("mean_similarity", 0.0)),
-        "texture_enabled": int(bool(best.get("texture_enabled", False))),
-        "texture_evaluated": int(bool(best.get("texture_evaluated", False))),
-        "texture_available": int(bool(best.get("texture_available", False))),
-        "texture_similarity": float(best.get("texture_similarity", 0.0)),
-        "texture_overlap_fraction": float(best.get("texture_overlap_fraction", 0.0)),
-        "texture_valid_blocks": int(best.get("texture_valid_blocks", 0)),
-        "geometry_similarity": float(best.get("geometry_similarity", 0.0)),
-        "geometry_weight": float(best.get("geometry_weight", 1.0)),
-        "texture_weight": float(best.get("texture_weight", 0.0)),
-        "texture_decision": str(best.get("texture_decision", "")),
-    }
 
 
 def rate_at_threshold(labels: np.ndarray, scores: np.ndarray, threshold: float) -> dict[str, Any]:
@@ -563,6 +429,7 @@ def build_effective_config_snapshot(config: dict[str, Any]) -> dict[str, Any]:
         "enrollment",
         "template_management",
         "identification",
+        "online_unlock",
         "evaluation",
         "descriptor_sources",
     ):
@@ -841,13 +708,24 @@ def write_plots(labels: np.ndarray, scores: np.ndarray, curve: list[dict[str, An
 
 
 def write_unlock_timing_report(score_rows: list[dict[str, str]], output_dir: str | Path) -> dict[str, Any]:
-    """Write phone-unlock timing summaries for genuine attempts."""
+    """从本人验证记录中生成手机解锁耗时明细和汇总报告。
+
+    离线评估中的本人尝试可用于估算查询模板构建和完整模板匹配耗时，但该流程
+    不启用在线早停，因此它不是最终在线延迟数据；准确的早停延迟应由
+    ``run_online_unlock.py --benchmark`` 测量。
+    """
 
     rows: list[dict[str, Any]] = []
+    total_genuine_attempts = 0
+    failed_genuine_attempts = 0
     match_values: list[float] = []
     end_to_end_values: list[float] = []
     for row in score_rows:
         if int(row.get("label", 0)) != 1:
+            continue
+        total_genuine_attempts += 1
+        if int(row.get("accepted_at_selected_threshold", 0)) != 1:
+            failed_genuine_attempts += 1
             continue
         match_ms = parse_float(row.get("unlock_match_ms"))
         end_to_end_ms = parse_float(row.get("unlock_end_to_end_ms"))
@@ -881,16 +759,32 @@ def write_unlock_timing_report(score_rows: list[dict[str, str]], output_dir: str
                 "geometry_weight": row.get("geometry_weight", ""),
                 "texture_weight": row.get("texture_weight", ""),
                 "texture_decision": row.get("texture_decision", ""),
+                "registered_template_load_ms": row.get("registered_template_load_ms", ""),
+                "descriptor_prepare_ms": row.get("descriptor_prepare_ms", ""),
+                "candidate_generation_ms": row.get("candidate_generation_ms", ""),
+                "candidate_filter_ms": row.get("candidate_filter_ms", ""),
+                "ransac_ms": row.get("ransac_ms", ""),
+                "inlier_refinement_ms": row.get("inlier_refinement_ms", ""),
+                "texture_similarity_ms": row.get("texture_similarity_ms", ""),
+                "score_fusion_ms": row.get("score_fusion_ms", ""),
+                "postprocess_ms": row.get("postprocess_ms", ""),
+                "image_match_total_ms": row.get("image_match_total_ms", ""),
+                "identity_fusion_ms": row.get("identity_fusion_ms", ""),
+                "identity_match_overhead_ms": row.get("identity_match_overhead_ms", ""),
+                "identity_match_total_ms": row.get("identity_match_total_ms", ""),
             }
         )
     out = ensure_dir(output_dir)
     write_csv_rows(Path(out) / "unlock_timing.csv", rows)
     summary = {
         "definition": {
-            "unlock_match_ms": "Query template already exists; registered templates are preloaded; time to score one query against one enrolled finger template set.",
-            "unlock_end_to_end_ms": "query_template_build_ms + unlock_match_ms. Model/SIFT initialization and image acquisition are not included.",
+            "timing_scope": "只统计在 selected threshold 下成功接受的本人解锁记录。",
+            "unlock_match_ms": "查询模板已存在时，与一个手指的注册模板集合完成匹配的时间。",
+            "unlock_end_to_end_ms": "query_template_build_ms + unlock_match_ms；不包含模型/SIFT初始化和传感器采集。",
         },
-        "genuine_attempts": len(rows),
+        "total_genuine_attempts": total_genuine_attempts,
+        "successful_unlocks_timed": len(rows),
+        "failed_unlocks_excluded": failed_genuine_attempts,
         "match_only": summarize_timing(match_values),
         "end_to_end": summarize_timing(end_to_end_values),
     }
@@ -936,28 +830,16 @@ def run_descriptor_l2_evaluation(
             f"identification.match_score_threshold must be in [0,1], got {selected_threshold}"
         )
     fusion_method = str(identification_cfg.get("fusion_method", "max"))
-    requested_early_stop_threshold = unlock_early_stop_threshold(config, fusion_method)
-    disable_early_stop_for_sweep = bool(evaluation_cfg.get("disable_early_stop_for_threshold_sweep", True))
-    scoring_config = config
-    if disable_early_stop_for_sweep and requested_early_stop_threshold is not None:
-        scoring_config = copy.deepcopy(config)
-        scoring_config.setdefault("identification", {})["early_stop_on_unlock_threshold"] = False
-    early_stop_threshold = unlock_early_stop_threshold(scoring_config, fusion_method)
+    # 离线标定必须遍历全部注册模板并保留真实 identity 最大分数，否则阈值曲线、
+    # FAR 和 FRR 会受模板顺序影响。固定阈值早停仅由独立的在线解锁引擎处理。
+    scoring_config = copy.deepcopy(config)
+    scoring_config.setdefault("identification", {})["early_stop_on_unlock_threshold"] = False
     far_points = [float(point) for point in evaluation_cfg.get("far_points", [0.001, 0.0001])]
     rng = np.random.default_rng(int(dict(config.get("enrollment", {})).get("random_seed", 42)))
     max_impostors = max(0, int(max_impostor_identities_per_query))
     cache: dict[str, dict[str, Any]] = {}
     scores_path = out / "verification_scores.csv"
     management_cfg = dict(config.get("template_management", {}))
-    apply_template_updates = bool(management_cfg.get("enabled", False)) and bool(
-        management_cfg.get("apply_during_evaluation", False)
-    )
-    template_manager: TemplateLibraryManager | None = None
-    learning_events: list[dict[str, Any]] = []
-    if apply_template_updates:
-        if source != "hardnet":
-            raise ValueError("dynamic template learning currently supports HardNet templates only")
-        template_manager = TemplateLibraryManager(identities, out.parent, management_cfg)
 
     # 第一遍：逐 query 逐 identity 打分，并把每次验证尝试写入 CSV。
     with scores_path.open("w", encoding="utf-8", newline="") as handle:
@@ -984,6 +866,7 @@ def run_descriptor_l2_evaluation(
                     scoring_config,
                     cache,
                     descriptor_source=source,
+                    early_stop_threshold=None,
                 )
                 attempt_ms = (time.perf_counter() - started) * 1000.0
                 score = float(result["score"])
@@ -1008,25 +891,6 @@ def run_descriptor_l2_evaluation(
                     }
                 )
 
-            # 静态FAR/FRR记录完成后，再按真实线上提前停止语义执行一次本人模板库匹配。
-            # 该步骤只根据匹配证据决定是否学习，不把数据集label传给学习准入函数。
-            # 使用本人identity仅用于模拟手机中“已声明/已绑定唯一身份”的在线更新场景。
-            if template_manager is not None and genuine:
-                event = template_manager.process_query(
-                    query_template,
-                    genuine[0],
-                    config,
-                    template_loader=lambda path, required=source: load_template_cached(
-                        path,
-                        cache,
-                        require=required,
-                    ),
-                    matcher=match_templates_descriptor_l2,
-                    descriptor_source=source,
-                )
-                event["query_template_path"] = str(query_template_path)
-                learning_events.append(event)
-
     # 第二遍：读取分数 CSV，统一计算指标和目标阈值。
     score_rows = read_csv_rows(scores_path)
     labels = np.asarray([int(row["label"]) for row in score_rows], dtype=np.int32)
@@ -1044,20 +908,11 @@ def run_descriptor_l2_evaluation(
     unlock_timing = write_unlock_timing_report(score_rows, out)
     failure_summary = export_failure_cases(score_rows, metrics.get("target_operating_point"), out, config) if export_failures else {"enabled": False, "reason": "export_failures_false"}
     effective_config = build_effective_config_snapshot(scoring_config)
-    if template_manager is not None:
-        event_rows: list[dict[str, Any]] = []
-        for event in learning_events:
-            row = {key: value for key, value in event.items() if key != "learning_evidences"}
-            row["learning_evidences"] = json.dumps(event.get("learning_evidences", []), ensure_ascii=False)
-            event_rows.append(row)
-        write_csv_rows(out / "template_learning_events.csv", event_rows)
-        write_json(out / "template_learning_events.json", learning_events)
-        template_management_summary = template_manager.summarize_events(learning_events)
-    else:
-        template_management_summary = {
-            "enabled": bool(management_cfg.get("enabled", False)),
-            "apply_during_evaluation": False,
-        }
+    template_management_summary = {
+        "enabled": False,
+        "requested_in_config": bool(management_cfg.get("enabled", False)),
+        "reason": "offline_calibration_never_updates_templates",
+    }
     metrics.update(
         {
             "descriptor_source": source,
@@ -1068,13 +923,10 @@ def run_descriptor_l2_evaluation(
             "num_genuine_attempts": int(np.sum(labels == 1)),
             "num_impostor_attempts": int(np.sum(labels == 0)),
             "fusion_method": fusion_method,
-            "early_stop_on_unlock_threshold": early_stop_threshold is not None,
-            "early_stop_threshold": early_stop_threshold,
-            "early_stop_requested": requested_early_stop_threshold is not None,
-            "requested_early_stop_threshold": requested_early_stop_threshold,
-            "early_stop_disabled_for_threshold_sweep": bool(
-                disable_early_stop_for_sweep and requested_early_stop_threshold is not None
-            ),
+            "scoring_mode": "offline_full_threshold_calibration",
+            "offline_full_template_scoring": True,
+            "early_stop_on_unlock_threshold": False,
+            "early_stop_threshold": None,
             "max_impostor_identities_per_query": max_impostors,
             "matching_config": dict(scoring_config.get("matching", {})),
             "texture_verification_config": dict(scoring_config.get("texture_verification", {})),
@@ -1131,10 +983,10 @@ def summary_row(metrics: dict[str, Any], far_points: list[float]) -> dict[str, A
         "num_match_attempts": metrics.get("num_match_attempts", ""),
         "num_genuine_attempts": metrics.get("num_genuine_attempts", ""),
         "num_impostor_attempts": metrics.get("num_impostor_attempts", ""),
+        "scoring_mode": metrics.get("scoring_mode", ""),
+        "offline_full_template_scoring": metrics.get("offline_full_template_scoring", ""),
         "early_stop_on_unlock_threshold": metrics.get("early_stop_on_unlock_threshold", ""),
         "early_stop_threshold": metrics.get("early_stop_threshold", ""),
-        "early_stop_requested": metrics.get("early_stop_requested", ""),
-        "early_stop_disabled_for_threshold_sweep": metrics.get("early_stop_disabled_for_threshold_sweep", ""),
         "texture_verification_enabled": texture_config.get("enabled", ""),
         "geometry_weight": texture_config.get("geometry_weight", ""),
         "texture_weight": texture_config.get("texture_weight", ""),

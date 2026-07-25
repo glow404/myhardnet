@@ -13,7 +13,7 @@ conda activate hardnet-cuda
 
 ## 1. `run_hardnet_matching.py`
 
-**作用**：HardNet 主实验。只检测 SIFT 关键点位置/方向，计算 HardNet 描述子并匹配；**不计算、不保存 SIFT/RootSIFT 描述子**。模板还会无损保存原始 `uint8` 灰度图，供仿射对齐后的脊线纹理验证使用。
+**作用**：HardNet 离线阈值标定实验。只检测 SIFT 关键点位置/方向，计算 HardNet 描述子并匹配；**不计算、不保存 SIFT/RootSIFT 描述子**。离线入口始终遍历全部注册模板并生成完整 FAR/FRR 曲线。
 
 **运行参数**默认写在 `match_new/config_match_new.yaml`：
 
@@ -84,7 +84,7 @@ python match_new\run_hardnet_matching.py `
 | `--limit_identities` | 调试：限制 identity 数量 |
 | `--limit_images_per_identity` | 调试：限制每个 identity 的图像数量 |
 
-**解锁提前停止**：
+**离线标定与在线早停**：
 
 `config_match_new.yaml` 中默认启用：
 
@@ -106,14 +106,49 @@ identification:
 | `early_stopped` | 是否因为达到阈值提前停止 |
 | `early_stop_threshold` | 本次使用的提前停止阈值 |
 
-该策略适合实际手机解锁，但不能直接用于完整阈值扫描：在 `0.55` 提前停止后，无法知道剩余模板是否能达到更高分数。正式 FAR/FRR 实验默认使用：
+该策略只由 `run_online_unlock.py` 使用。`run_hardnet_matching.py` 无条件完整匹配，不会读取在线早停开关来改变离线分数，因此生成的阈值曲线始终有效。
 
-```yaml
-evaluation:
-  disable_early_stop_for_threshold_sweep: true
+## 2. `run_online_unlock.py`
+
+**作用**：使用当前在线配置匹配指定的已注册手指，命中阈值后立即返回，不生成阈值曲线。批量基准只用成功解锁记录计算最快、平均值和百分位数，匹配失败记录保留在明细 CSV 中但不参与耗时统计。
+
+单张解锁：
+
+```powershell
+python match_new\run_online_unlock.py `
+  --artifacts match_new\ysjz_V4 `
+  --identity dy_L0 `
+  --image D:\query.bmp
 ```
 
-评估时会临时关闭提前停止并计算完整最高分；`identification.early_stop_on_unlock_threshold` 仍保留给实际在线解锁。此时评估生成的 `unlock_timing` 是全模板匹配耗时，不代表线上提前停止耗时。
+批量 genuine query 延迟测试：
+
+```powershell
+python match_new\run_online_unlock.py `
+  --artifacts match_new\ysjz_V4 `
+  --benchmark
+```
+
+在线入口通过 `--artifacts` 和 `online_unlock.identity_templates`、`online_unlock.split_metadata` 直接定位离线产物，不需要部署档案。在线耗时测试以当前 YAML 配置为准，不要求模型、预处理、匹配参数和阈值与离线一致。
+
+在线基准输出：
+
+- `online_unlock_attempts.csv`：全部成功和失败尝试的逐次明细；`included_in_timing_statistics` 表示是否进入汇总。
+- `online_unlock_summary.json`：仅基于 `accepted=true` 的成功解锁生成耗时统计。
+
+模板构建阶段包括 `image_read_ms`、`sift_keypoint_detection_ms`、
+`keypoint_filter_ms`、`patch_crop_rotate_ms`、`hardnet_inference_ms` 和
+`template_assembly_ms`。匹配阶段包括 `registered_template_load_ms`、
+`candidate_generation_ms`、`candidate_filter_ms`、`ransac_ms`、
+`inlier_refinement_ms`、`texture_similarity_ms`、`score_fusion_ms` 和
+`identity_fusion_ms` 等字段。每个阶段都输出最快、平均、最慢及配置指定的
+百分位数。
+
+离线主实验还会把每张图像的注册分阶段耗时写入
+`template_build_timings.csv`，并在 `enrollment_timing.csv/json` 中按手指
+累计。注册统计额外包含 `template_persist_ms`（模板落盘）和
+`template_registration_overhead_ms`，因此各阶段之和可以与一个手指的
+`registration_total_ms` 对账。
 
 **换 checkpoint 示例**：
 
@@ -178,6 +213,10 @@ FAR/FRR 阈值曲线写入 `match_score_threshold_curve.csv`。默认按 `0.01` 
 
 ### 动态模板学习、替换与LRU排序
 
+离线阈值标定不再执行模板学习。当前在线入口也默认设置
+`online_unlock.template_learning_after_decision: false`，避免模板学习阻塞解锁；
+以下模块保留给后续独立的解锁后异步学习流程。
+
 动态模板库由以下模块组成：
 
 | 模块 | 职责 |
@@ -191,8 +230,7 @@ FAR/FRR 阈值曲线写入 `match_score_threshold_curve.csv`。默认按 `0.01` 
 
 ```yaml
 template_management:
-  enabled: true
-  apply_during_evaluation: true
+  enabled: false
   reset_library_on_start: true
 
   max_active_templates: 40
@@ -253,7 +291,7 @@ Windows 下杀毒软件、文件索引器或同步程序可能短暂占用 `temp
 
 ---
 
-## 2. `ablation.py`
+## 3. `ablation.py`
 
 **作用**：在已有模板基础上，扫描不同匹配参数组合（`top_k`、`ratio_threshold`、`candidate_policy`），快速比较调参效果。不重新提特征。
 
@@ -299,7 +337,7 @@ run_hardnet_matching.py          # 首次构建模板
 
 ---
 
-## 3. `visualize_hardnet_inliers.py`
+## 4. `visualize_hardnet_inliers.py`
 
 **作用**：单独查看 HardNet 的内点匹配可视化。脚本从一个原始图像目录扫描指纹图像，构建 HardNet 模板，然后按 `run_hardnet_matching.py` / FAR-FRR 评估中相同的 genuine 匹配逻辑，为每个 query 匹配本人注册模板库中的最佳模板，最后导出：
 

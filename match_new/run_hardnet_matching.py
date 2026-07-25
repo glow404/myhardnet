@@ -40,9 +40,23 @@ MATCH_NEW_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = MATCH_NEW_DIR / "config_match_new.yaml"
 DEFAULT_OUTPUT_DIR = "outputs"
 
+# 单张注册模板总时长的完整组成。这里不包含 template_total_ms、sift_ms 等
+# 聚合/兼容字段，避免在按手指求和时重复计算同一阶段。
+ENROLLMENT_STAGE_FIELDS = (
+    "image_read_ms",
+    "sift_keypoint_detection_ms",
+    "keypoint_filter_ms",
+    "patch_crop_rotate_ms",
+    "hardnet_inference_ms",
+    "template_assembly_ms",
+    "template_pipeline_overhead_ms",
+    "template_persist_ms",
+    "template_registration_overhead_ms",
+)
+
 
 def numeric(value: Any) -> float | None:
-    """Convert a CSV/JSON value to float when possible."""
+    """尽可能把 CSV/JSON 中的值转换为浮点数；空值或非法值返回 ``None``。"""
 
     try:
         if value in {"", None}:
@@ -53,7 +67,7 @@ def numeric(value: Any) -> float | None:
 
 
 def percentile(values: list[float], q: float) -> float | None:
-    """Return a simple nearest-rank percentile for small timing reports."""
+    """用最近秩方式计算小规模耗时样本的百分位数。"""
 
     if not values:
         return None
@@ -64,7 +78,7 @@ def percentile(values: list[float], q: float) -> float | None:
 
 
 def summarize_values(values: list[float]) -> dict[str, Any]:
-    """Summarize millisecond timing values."""
+    """汇总一组毫秒耗时，输出总计、均值、范围及 P50/P95。"""
 
     if not values:
         return {"count": 0}
@@ -81,7 +95,12 @@ def summarize_values(values: list[float]) -> dict[str, Any]:
 
 
 def build_enrollment_timing_report(success_rows: list[dict[str, str]], identity_payload: dict[str, Any]) -> dict[str, Any]:
-    """Aggregate selected enrollment image build times into per-finger timing."""
+    """按手指汇总被选中注册图像的模板构建时间。
+
+    单个手指的注册总时长等于其全部注册图像模板构建耗时之和；缺失的耗时会单独
+    计数，避免把不完整数据误当作真实注册时长。除总时长外，还会累计图像读取、
+    SIFT 检测、关键点筛选、局部块裁剪旋转、HardNet 推理和模板持久化等阶段。
+    """
 
     row_by_key = {(row["identity_id"], row["image_id"]): row for row in success_rows}
     per_identity: list[dict[str, Any]] = []
@@ -90,26 +109,68 @@ def build_enrollment_timing_report(success_rows: list[dict[str, str]], identity_
         image_ids = [str(image_id) for image_id in identity.get("template_image_ids", [])]
         values: list[float] = []
         missing = 0
+        stage_values = {
+            field: []
+            for field in ENROLLMENT_STAGE_FIELDS
+        }
+        missing_stage_timing_values = 0
         for image_id in image_ids:
             row = row_by_key.get((identity_id, image_id))
             elapsed = numeric(row.get("template_build_ms") if row else None)
             if elapsed is None:
                 missing += 1
-                continue
-            values.append(elapsed)
+            else:
+                values.append(elapsed)
+            for field in ENROLLMENT_STAGE_FIELDS:
+                stage_elapsed = numeric(row.get(field) if row else None)
+                if stage_elapsed is None:
+                    missing_stage_timing_values += 1
+                else:
+                    stage_values[field].append(stage_elapsed)
         summary = summarize_values(values)
+        stage_complete = bool(image_ids) and all(
+            len(stage_values[field]) == len(image_ids)
+            for field in ENROLLMENT_STAGE_FIELDS
+        )
+        stage_totals = {
+            field: (
+                float(sum(stage_values[field]))
+                if len(stage_values[field]) == len(image_ids) and image_ids
+                else ""
+            )
+            for field in ENROLLMENT_STAGE_FIELDS
+        }
+        accounted_stage_ms = (
+            float(sum(float(value) for value in stage_totals.values()))
+            if stage_complete
+            else ""
+        )
+        registration_total_ms = summary.get("total_ms", "")
         per_identity.append(
             {
                 "identity_id": identity_id,
                 "num_enrollment_templates": len(image_ids),
                 "num_timed_templates": len(values),
                 "missing_timing_count": missing,
-                "registration_total_ms": summary.get("total_ms", ""),
+                "stage_timing_complete": int(stage_complete),
+                "missing_stage_timing_values": missing_stage_timing_values,
+                "registration_total_ms": registration_total_ms,
                 "registration_avg_template_ms": summary.get("avg_ms", ""),
                 "registration_min_template_ms": summary.get("min_ms", ""),
                 "registration_max_template_ms": summary.get("max_ms", ""),
                 "registration_p50_template_ms": summary.get("p50_ms", ""),
                 "registration_p95_template_ms": summary.get("p95_ms", ""),
+                **{
+                    f"registration_{field}": value
+                    for field, value in stage_totals.items()
+                },
+                "registration_accounted_stage_ms": accounted_stage_ms,
+                "registration_accounting_error_ms": (
+                    float(registration_total_ms) - float(accounted_stage_ms)
+                    if registration_total_ms not in {"", None}
+                    and accounted_stage_ms not in {"", None}
+                    else ""
+                ),
             }
         )
     totals = [float(row["registration_total_ms"]) for row in per_identity if row.get("registration_total_ms") not in {"", None}]
@@ -120,7 +181,7 @@ def parse_args() -> argparse.Namespace:
     """解析命令行参数。默认值都在配置文件中；这里只提供覆盖项。"""
 
     parser = argparse.ArgumentParser(
-        description="Run HardNet L2 phone-unlock matching experiment. Defaults come from --config YAML.",
+        description="运行 HardNet L2 手机指纹解锁离线评估；默认参数来自 --config 指定的 YAML。",
     )
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="配置文件路径。")
     parser.add_argument("--image-root", "--image_root", dest="image_root", default=None, help="覆盖 data.image_root。")
@@ -281,7 +342,7 @@ def main() -> None:
     if not checkpoint.exists() and not settings["skip_template_build"]:
         raise FileNotFoundError(f"HardNet checkpoint does not exist: {checkpoint}")
 
-    # 1. Scan raw images directly and optionally limit the dataset for debugging.
+    # 1. 直接扫描原始图像；调试时可按 identity 数和每个 identity 的图像数裁剪数据。
     output_dir = ensure_dir(settings["output_dir"])
     rows = load_raw_image_metadata(config)
     rows = limit_rows_for_debug(rows, int(settings["limit_identities"]), int(settings["limit_images_per_identity"]))
@@ -342,7 +403,6 @@ def main() -> None:
         max_impostor_identities_per_query=int(settings["max_impostor_identities_per_query"]),
         export_failures=bool(settings["export_failures"]),
     )
-
     # 5. 汇总一行 CSV/JSON，方便和其他实验横向比较。
     far_points = [float(point) for point in dict(config.get("evaluation", {})).get("far_points", [0.001, 0.0001])]
     summary = [summary_row(result["metrics"], far_points)]
@@ -368,7 +428,17 @@ def main() -> None:
             },
         },
     )
-    print(json.dumps({"summary_csv": str(summary_csv), "summary_json": str(summary_json), "outputs": str(output_dir)}, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {
+                "summary_csv": str(summary_csv),
+                "summary_json": str(summary_json),
+                "outputs": str(output_dir),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

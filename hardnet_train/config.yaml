@@ -12,8 +12,11 @@ data:
   val_csv: ../outputs/hardnet_dataset/val_pairs.csv
   test_csv: ../outputs/hardnet_dataset/test_pairs.csv
   normalize: true
-  num_workers: 0
-  pin_memory: false
+  # Windows 下使用多个常驻 worker 提前读取 patch，减少 GPU 等待磁盘/PIL 解码。
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
   max_train_rows:
   max_val_rows:
   max_train_rows_per_finger:
@@ -24,7 +27,13 @@ model:
   final_bn_affine: false  #作用：控制最后一层批归一化（BatchNorm）是否学习缩放和平移参数。
 
 training:
-  device: auto
+  # 明确要求 CUDA，避免 CUDA 版 PyTorch 缺失时静默退回 CPU。
+  device: cuda
+  # 卷积前向使用 FP16，hardest-negative 距离矩阵和 loss 仍使用 FP32。
+  mixed_precision: fp16
+  channels_last: true
+  cudnn_benchmark: true
+  allow_tf32: true
   # 指纹数据比 Brown patch 更难，最大训练 100 epoch，并支持从 last.pt 续训。
   epochs: 500
   steps_per_epoch: 1000

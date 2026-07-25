@@ -11,10 +11,10 @@
 output:
   # 实验结果根目录。相对路径相对本配置文件所在目录解析。
   # 其下会生成 image_templates/、eval_hardnet_l2/、各类 CSV/JSON 等。
-  output_dir: Quant_tiny_V1_4
+  output_dir: ysjz_V4
 
 runtime:
-  skip_template_build: true
+  skip_template_build: false
 
   # 每个 query 最多比对几个非本人 identity；0 表示全量 impostor。
   max_impostor_identities_per_query: 0
@@ -28,7 +28,7 @@ runtime:
 
 data:
   # 原始指纹图像根目录。匹配任务会直接扫描原图，不依赖 pair_build 产物。
-  image_root: ../datasets/Quant_tiny_V1_4
+  image_root: ../datasets/ysjz_V4
 
   # 相对 image_root 的前几级目录共同组成一个手指的 identity_id。
   # 当前目录形如 dy_L0/pair_1.bmp，因此使用前 1 级。
@@ -47,11 +47,19 @@ model:
   dropout: 0.3
   final_bn_affine: false
 
-  # auto 表示优先 cuda，否则 cpu。
+  # auto 表示优先使用 CUDA；CUDA 不可用时自动使用 CPU。
   device: auto
+  fallback_to_cpu: true
 
   # 建模版时，HardNet patch 一次批量推理 batch size个patch。
   batch_size: 512
+
+  # GPU 推理优化。FP16 仅用于 CNN 前向，返回的描述子仍转换为 FP32。
+  inference_precision: fp16
+  channels_last: true
+  pin_memory: true
+  cudnn_benchmark: true
+  allow_tf32: true
 
 sift:
   # SIFT 在 HardNet 主实验中只负责提供关键点位置和方向；
@@ -104,7 +112,7 @@ matching:
 
   # 是否启用双向 Lowe 比值验证。
   # 仅影响 ratio_only 和 topk_or_ratio 的 ratio 分支；topk_only 不使用该参数。
-  bidirectional_ratio_test: true
+  bidirectional_ratio_test: false
 
   # 绝对距离上限。最近邻距离仍必须不超过该值
   abs_distance_threshold: 1.5
@@ -115,7 +123,7 @@ matching:
 
   # RANSAC 前允许一对多候选，避免局部纹理重复时过早删掉真匹配；
   # RANSAC 后再做 one-to-one 去重。  开启双向验证时，这个参数不起作用。
-  allow_many_to_one_before_ransac: false
+  allow_many_to_one_before_ransac: true
 
   # 候选过多会拖慢 RANSAC，也容易引入噪声，所以进入 RANSAC 前截断。
   max_candidates_for_ransac: 300
@@ -174,10 +182,7 @@ enrollment:
 
 template_management:
   # 动态模板库总开关。初始20张注册模板全部作为受保护seed，之后只学习HardNet模板。
-  enabled: true
-
-  # 在当前FAR/FRR数据流中按query顺序执行在线学习。关闭后只运行原有静态评估。
-  apply_during_evaluation: true
+  enabled: false
 
   # true保证每次实验从同一批20张初始模板开始，便于重复对比。
   # 实际长期在线运行时应改为false，继续读取上次保存的template_library.json。
@@ -231,25 +236,43 @@ identification:
   # 为空/null 时默认使用 match_score_threshold。若要用其他线上解锁阈值，可在这里单独设置。
   early_stop_threshold:
 
+online_unlock:
+  # 在线入口直接从 output.output_dir（或命令行 --artifacts）下读取这些离线产物。
+  # 相对路径相对于产物目录解析；留空时按注册模板数量自动推导默认文件名。
+  identity_templates:
+  split_metadata:
+  image_templates_dir: image_templates
+
+  # 启动时将注册模板加载到内存，模板加载时间不计入单次解锁耗时。
+  preload_templates: true
+
+  # 模型启动后用空patch预热，预热时间单独统计。
+  model_warmup_runs: 3
+
+  # query模板只在内存中使用，不写入image_templates。
+  persist_query_template: false
+
+  # 当前在线延迟路径不执行模板学习；后续应在返回解锁结果后异步处理。
+  template_learning_after_decision: false
+
+  # 相对于output.output_dir的批量在线延迟测试目录。
+  benchmark_output_dir: online_unlock_benchmark
+
+  # 汇总只统计 accepted=true 的成功解锁；失败尝试仅保留在明细 CSV 中。
+  timing:
+    percentiles: [50, 90, 95, 99]
+
 evaluation:
   # 正式手机解锁目标：FAR < 1/50000，FRR < 2%。
   target_far: 0.00002
   target_frr: 0.02
 
-  # 正式 FAR/FRR 需要每个 identity 的完整最高分。若提前停止在 0.55，
-  # 则 0.55 以上的阈值曲线会被截断，因此阈值扫描默认临时关闭提前停止。
-  # identification 中的提前停止配置仍保留给实际在线解锁使用。
-  disable_early_stop_for_threshold_sweep: true
-
   # 额外报告 TAR/FRR@FAR 的点。
   far_points: [0.001, 0.0001, 0.00002]
 
-  # true 表示除手写阈值外，按 score_threshold_step 补齐 [0,1] 连续分数阈值。
+  # true 表示按 score_threshold_step 扫描 [0,1] 连续分数阈值。
   auto_thresholds: true
   score_threshold_step: 0.01
-
-  # 固定匹配分数阈值列表，用于横向对比实验。
-  score_thresholds: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.55, 0.6, 0.7, 0.8, 0.9, 1.0]
 
   failure_export:
     # 在 target_operating_point 阈值下导出失败样本。

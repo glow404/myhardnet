@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -505,6 +506,7 @@ def compute_fused_match_score(
         "geometry_weight": 1.0,
         "texture_weight": 0.0,
         "texture_decision": "disabled",
+        "texture_similarity_ms": 0.0,
     }
     if unique_count < low_unique:
         diagnostics["texture_decision"] = "geometry_below_low_gate"
@@ -524,7 +526,11 @@ def compute_fused_match_score(
         )
 
     diagnostics["texture_evaluated"] = True
+    texture_started = time.perf_counter()
     texture = ridge_texture_similarity(query_image, gallery_image, matrix, cfg)
+    diagnostics["texture_similarity_ms"] = (
+        time.perf_counter() - texture_started
+    ) * 1000.0
     diagnostics["texture_available"] = bool(texture["available"])
     diagnostics["texture_similarity"] = float(texture["similarity"])
     diagnostics["texture_overlap_fraction"] = float(texture["overlap_fraction"])
@@ -681,6 +687,18 @@ def match_templates_descriptor_l2(query: dict[str, Any], gallery: dict[str, Any]
         6. 用 unique_inliers 作为主分数。
     """
 
+    match_started = time.perf_counter()
+    timings = {
+        "descriptor_prepare_ms": 0.0,
+        "candidate_generation_ms": 0.0,
+        "candidate_filter_ms": 0.0,
+        "ransac_ms": 0.0,
+        "inlier_refinement_ms": 0.0,
+        "texture_similarity_ms": 0.0,
+        "score_fusion_ms": 0.0,
+        "postprocess_ms": 0.0,
+        "image_match_total_ms": 0.0,
+    }
     cfg = dict(config.get("matching", {}))
     base = empty_result(query, gallery)
     base["texture_enabled"] = bool(dict(config.get("texture_verification", {})).get("enabled", False))
@@ -689,12 +707,20 @@ def match_templates_descriptor_l2(query: dict[str, Any], gallery: dict[str, Any]
     source = str(descriptor_source).lower()
 
     def finish(result: dict[str, Any], debug: dict[str, Any] | None = None) -> dict[str, Any]:
+        timings["image_match_total_ms"] = (
+            time.perf_counter() - match_started
+        ) * 1000.0
+        result.update(timings)
         if include_debug:
             result = {**result, "debug_matches": debug or empty_debug_matches()}
         return result
 
+    stage_started = time.perf_counter()
     desc_q = select_l2_descriptors(query, source)
     desc_g = select_l2_descriptors(gallery, source)
+    timings["descriptor_prepare_ms"] = (
+        time.perf_counter() - stage_started
+    ) * 1000.0
     base["num_keypoints_q"] = int(desc_q.shape[0])
     base["num_keypoints_g"] = int(desc_g.shape[0])
     base["descriptor_source"] = source
@@ -705,19 +731,28 @@ def match_templates_descriptor_l2(query: dict[str, Any], gallery: dict[str, Any]
     gallery_xy = np.asarray(gallery["keypoints_xy"], dtype=np.float32)
 
     # 阶段 1：L2 候选生成。
+    stage_started = time.perf_counter()
     candidates = build_l2_candidates(query, gallery, cfg, descriptor_source=source)
+    timings["candidate_generation_ms"] = (
+        time.perf_counter() - stage_started
+    ) * 1000.0
     base["num_raw_matches"] = int(len(candidates))
 
     # 阶段 2：候选过多时做软截断，并记录主方向差作为诊断指标。
+    stage_started = time.perf_counter()
     candidates_for_ransac, dominant = soft_gate_candidates(candidates, cfg)
+    timings["candidate_filter_ms"] = (
+        time.perf_counter() - stage_started
+    ) * 1000.0
     base["num_candidates"] = int(len(candidates_for_ransac))
     base["dominant_angle_delta"] = float(dominant)
     # partial affine 至少需要两对坐标；这是算法的固定数学条件，不是打分阈值。
     if len(candidates_for_ransac) < 2:
         return finish(base, {"candidates": candidate_debug_rows(candidates_for_ransac, query_xy, gallery_xy), "raw_inliers": [], "unique_inliers": []})
 
-    src, dst = points_from_candidates(candidates_for_ransac, query_xy, gallery_xy)
     # 阶段 3：RANSAC 几何验证。这里的输入仍允许 many-to-one。
+    stage_started = time.perf_counter()
+    src, dst = points_from_candidates(candidates_for_ransac, query_xy, gallery_xy)
     matrix, inlier_mask = cv2.estimateAffinePartial2D(
         src,
         dst,
@@ -727,12 +762,20 @@ def match_templates_descriptor_l2(query: dict[str, Any], gallery: dict[str, Any]
         confidence=float(cfg.get("ransac_confidence", 0.995)),
         refineIters=10,
     )
+    timings["ransac_ms"] = (
+        time.perf_counter() - stage_started
+    ) * 1000.0
     if matrix is None or inlier_mask is None:
         return finish(base, {"candidates": candidate_debug_rows(candidates_for_ransac, query_xy, gallery_xy), "raw_inliers": [], "unique_inliers": []})
+
+    stage_started = time.perf_counter()
     scale_ok, affine_scale = scale_in_allowed_range(np.asarray(matrix, dtype=np.float64), cfg)
     base["affine_scale"] = float(affine_scale) if math.isfinite(affine_scale) else 0.0
     if not scale_ok:
         base["scale_rejected"] = True
+        timings["inlier_refinement_ms"] = (
+            time.perf_counter() - stage_started
+        ) * 1000.0
         return finish(base, {"candidates": candidate_debug_rows(candidates_for_ransac, query_xy, gallery_xy), "raw_inliers": [], "unique_inliers": []})
 
     mask = np.asarray(inlier_mask).reshape(-1).astype(bool)
@@ -740,6 +783,9 @@ def match_templates_descriptor_l2(query: dict[str, Any], gallery: dict[str, Any]
     base["num_inliers"] = int(len(raw_inliers))
     base["raw_inliers"] = int(len(raw_inliers))
     if len(raw_inliers) == 0:
+        timings["inlier_refinement_ms"] = (
+            time.perf_counter() - stage_started
+        ) * 1000.0
         return finish(base, {"candidates": candidate_debug_rows(candidates_for_ransac, query_xy, gallery_xy), "raw_inliers": [], "unique_inliers": []})
 
     # 阶段 4：把 RANSAC 原始 inliers 清理成真正的一对一 inliers。
@@ -752,6 +798,9 @@ def match_templates_descriptor_l2(query: dict[str, Any], gallery: dict[str, Any]
             if not refined_scale_ok:
                 base["affine_scale"] = float(refined_scale) if math.isfinite(refined_scale) else 0.0
                 base["scale_rejected"] = True
+                timings["inlier_refinement_ms"] = (
+                    time.perf_counter() - stage_started
+                ) * 1000.0
                 return finish(base, {"candidates": candidate_debug_rows(candidates_for_ransac, query_xy, gallery_xy), "raw_inliers": [], "unique_inliers": []})
             matrix = refined
             affine_scale = refined_scale
@@ -771,8 +820,12 @@ def match_templates_descriptor_l2(query: dict[str, Any], gallery: dict[str, Any]
         dominant,
         float(cfg.get("orientation_consistency_thresh_deg", 20.0)),
     )
+    timings["inlier_refinement_ms"] = (
+        time.perf_counter() - stage_started
+    ) * 1000.0
     # 阶段 5：unique inlier 数仅作为原始诊断值；最终 score 是 [0,1] 连续融合分数。
     raw_score = float(unique_count)
+    stage_started = time.perf_counter()
     score, texture_diagnostics = compute_fused_match_score(
         query,
         gallery,
@@ -780,6 +833,15 @@ def match_templates_descriptor_l2(query: dict[str, Any], gallery: dict[str, Any]
         unique_count,
         config,
     )
+    score_elapsed_ms = (time.perf_counter() - stage_started) * 1000.0
+    timings["texture_similarity_ms"] = float(
+        texture_diagnostics.get("texture_similarity_ms", 0.0)
+    )
+    timings["score_fusion_ms"] = max(
+        0.0,
+        score_elapsed_ms - timings["texture_similarity_ms"],
+    )
+    stage_started = time.perf_counter()
     quality_score = (
         0.55 * min(unique_count / 40.0, 1.0)
         + 0.20 * min(inlier_ratio, 1.0)
@@ -793,6 +855,9 @@ def match_templates_descriptor_l2(query: dict[str, Any], gallery: dict[str, Any]
         "raw_inliers": candidate_debug_rows(raw_inliers, query_xy, gallery_xy, raw_errors),
         "unique_inliers": candidate_debug_rows(kept, query_xy, gallery_xy, final_errors),
     }
+    timings["postprocess_ms"] = (
+        time.perf_counter() - stage_started
+    ) * 1000.0
 
     return finish({
         **base,

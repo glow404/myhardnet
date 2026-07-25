@@ -73,6 +73,8 @@ def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def make_loader(config: dict[str, Any], split: str, batch_size: int, steps: int, seed: int) -> DataLoader:
@@ -108,12 +110,68 @@ def make_loader(config: dict[str, Any], split: str, batch_size: int, steps: int,
         seed=seed,
         drop_incomplete=True,
     )
+    num_workers = max(0, int(data_cfg.get("num_workers", 0)))
+    loader_options: dict[str, Any] = {
+        "dataset": dataset,
+        "batch_sampler": sampler,
+        "num_workers": num_workers,
+        "pin_memory": bool(data_cfg.get("pin_memory", False)) and torch.cuda.is_available(),
+    }
+    # 只有多进程 DataLoader 支持持续 worker 和预取参数。持续 worker 可以避免
+    # Windows 在每个 epoch 都重新创建进程，预取则让 CPU 读图与 GPU 计算重叠。
+    if num_workers > 0:
+        loader_options["persistent_workers"] = bool(data_cfg.get("persistent_workers", True))
+        loader_options["prefetch_factor"] = max(1, int(data_cfg.get("prefetch_factor", 2)))
     return DataLoader(
-        dataset,
-        batch_sampler=sampler,
-        num_workers=int(data_cfg.get("num_workers", 0)),
-        pin_memory=bool(data_cfg.get("pin_memory", False)),
+        **loader_options,
     )
+
+
+def resolve_device(raw_device: str) -> torch.device:
+    """解析训练设备，并在明确要求 CUDA 但环境不可用时给出可操作错误。"""
+
+    requested = str(raw_device).strip().lower()
+    if requested == "auto":
+        requested = "cuda" if torch.cuda.is_available() else "cpu"
+    if requested.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(
+            "训练配置要求 CUDA，但当前 PyTorch 不支持 CUDA。请安装 CUDA 版 PyTorch，"
+            "并确认 torch.cuda.is_available() 返回 True；如需主动使用 CPU，请设置 "
+            "training.device=cpu。"
+        )
+    return torch.device(requested)
+
+
+def resolve_amp(
+    device: torch.device,
+    raw_precision: str,
+) -> tuple[bool, torch.dtype | None]:
+    """解析混合精度配置，返回是否启用 autocast 及其数据类型。"""
+
+    precision = str(raw_precision).strip().lower()
+    if precision in {"", "off", "none", "fp32", "float32"}:
+        return False, None
+    if device.type != "cuda":
+        return False, None
+    if precision in {"fp16", "float16"}:
+        return True, torch.float16
+    if precision in {"bf16", "bfloat16"}:
+        if not torch.cuda.is_bf16_supported():
+            raise RuntimeError("当前 GPU/PyTorch 不支持 BF16，请改用 training.mixed_precision=fp16。")
+        return True, torch.bfloat16
+    raise ValueError(f"不支持的 training.mixed_precision: {raw_precision!r}")
+
+
+def configure_cuda(device: torch.device, train_cfg: dict[str, Any]) -> None:
+    """应用只影响 CUDA 执行性能的后端选项。"""
+
+    if device.type != "cuda":
+        return
+    torch.backends.cudnn.benchmark = bool(train_cfg.get("cudnn_benchmark", True))
+    allow_tf32 = bool(train_cfg.get("allow_tf32", True))
+    torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+    torch.backends.cudnn.allow_tf32 = allow_tf32
+    torch.set_float32_matmul_precision("high" if allow_tf32 else "highest")
 
 
 def linear_lr(base_lr: float, step: int, total_steps: int) -> float:
@@ -176,6 +234,10 @@ def train_one_epoch(
     warmup_steps: int,
     eta_min: float,
     log_interval: int,
+    scaler: torch.amp.GradScaler,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype | None,
+    channels_last: bool,
 ) -> tuple[dict[str, float], int]:
     """训练一个 epoch。
 
@@ -202,15 +264,31 @@ def train_one_epoch(
         positive = batch["positive"].to(device, non_blocking=True)
         point_group = batch["point_group"].to(device, non_blocking=True)
         finger_group = batch["finger_group"].to(device, non_blocking=True)
+        if channels_last:
+            anchor = anchor.contiguous(memory_format=torch.channels_last)
+            positive = positive.contiguous(memory_format=torch.channels_last)
 
         # 两个分支共享同一个 HardNet 权重，等价于 siamese/two-stream CNN。
         optimizer.zero_grad(set_to_none=True)
-        anchor_desc = model(anchor)
-        positive_desc = model(positive)
+        with torch.autocast(
+            device_type=device.type,
+            dtype=amp_dtype,
+            enabled=amp_enabled,
+        ):
+            anchor_desc = model(anchor)
+            positive_desc = model(positive)
         # point_group 会屏蔽同一物理点，避免伪负样本参与 hardest negative。
-        loss, stats = criterion(anchor_desc, positive_desc, point_group=point_group, finger_group=finger_group)
-        loss.backward()
-        optimizer.step()
+        # 描述子网络使用 AMP，距离矩阵和 hardest-negative loss 保持 FP32，
+        # 避免极接近样本在半精度下出现排序抖动。
+        loss, stats = criterion(
+            anchor_desc.float(),
+            positive_desc.float(),
+            point_group=point_group,
+            finger_group=finger_group,
+        )
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         # 日志中的 pos/neg 是 batch 内平均距离，用于观察正负分布是否逐渐拉开。
         batch_size = anchor.size(0)
@@ -233,8 +311,16 @@ def train_one_epoch(
     return {"loss": loss_meter.value, "pos_dist": pos_meter.value, "neg_dist": neg_meter.value, "lr": lr}, global_step
 
 
-@torch.no_grad()
-def evaluate(model: HardNet, criterion: HardNetLoss, loader: DataLoader, device: torch.device) -> dict[str, float]:
+@torch.inference_mode()
+def evaluate(
+    model: HardNet,
+    criterion: HardNetLoss,
+    loader: DataLoader,
+    device: torch.device,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype | None,
+    channels_last: bool,
+) -> dict[str, float]:
     """在验证集上评估 loss、正负距离和 FPR95。"""
     model.eval()
     loss_meter = RunningMean()
@@ -246,7 +332,22 @@ def evaluate(model: HardNet, criterion: HardNetLoss, loader: DataLoader, device:
         positive = batch["positive"].to(device, non_blocking=True)
         point_group = batch["point_group"].to(device, non_blocking=True)
         finger_group = batch["finger_group"].to(device, non_blocking=True)
-        loss, stats = criterion(model(anchor), model(positive), point_group=point_group, finger_group=finger_group)
+        if channels_last:
+            anchor = anchor.contiguous(memory_format=torch.channels_last)
+            positive = positive.contiguous(memory_format=torch.channels_last)
+        with torch.autocast(
+            device_type=device.type,
+            dtype=amp_dtype,
+            enabled=amp_enabled,
+        ):
+            anchor_desc = model(anchor)
+            positive_desc = model(positive)
+        loss, stats = criterion(
+            anchor_desc.float(),
+            positive_desc.float(),
+            point_group=point_group,
+            finger_group=finger_group,
+        )
         batch_size = anchor.size(0)
         loss_meter.update(float(loss.item()), batch_size)
         valid = stats["valid_triplets"].cpu()
@@ -271,6 +372,7 @@ def save_checkpoint(
     epoch: int,
     global_step: int,
     metrics: dict[str, float],
+    scaler: torch.amp.GradScaler | None = None,
 ) -> None:
     """保存模型、优化器、配置和当前验证指标。"""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -282,6 +384,8 @@ def save_checkpoint(
         "metrics": metrics,
         "config": {key: value for key, value in config.items() if key != "_config_path"},
     }
+    if scaler is not None and scaler.is_enabled():
+        payload["amp_scaler"] = scaler.state_dict()
     torch.save(payload, path)
 
 
@@ -302,6 +406,7 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     steps_per_epoch: int,
+    scaler: torch.amp.GradScaler | None = None,
 ) -> tuple[int, int]:
     """加载 checkpoint，返回下一轮 epoch 和 global_step。"""
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -309,6 +414,8 @@ def load_checkpoint(
     if "optimizer" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer"])
         move_optimizer_state_to_device(optimizer, device)
+    if scaler is not None and scaler.is_enabled() and "amp_scaler" in checkpoint:
+        scaler.load_state_dict(checkpoint["amp_scaler"])
     finished_epoch = int(checkpoint.get("epoch", 0))
     global_step = int(checkpoint.get("global_step", finished_epoch * steps_per_epoch))
     return finished_epoch + 1, global_step
@@ -453,9 +560,17 @@ def main() -> None:
     set_seed(seed)
 
     device_name = args.device or train_cfg.get("device", "auto")
-    if device_name == "auto":
-        device_name = "cuda" if torch.cuda.is_available() else "cpu"
-    device = torch.device(device_name)
+    device = resolve_device(str(device_name))
+    configure_cuda(device, train_cfg)
+    amp_enabled, amp_dtype = resolve_amp(
+        device,
+        str(train_cfg.get("mixed_precision", "fp16")),
+    )
+    channels_last = device.type == "cuda" and bool(train_cfg.get("channels_last", True))
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=amp_enabled and amp_dtype == torch.float16,
+    )
 
     epochs = int(args.epochs or train_cfg.get("epochs", 10))
     steps_per_epoch = int(args.steps_per_epoch or train_cfg.get("steps_per_epoch", 1000))
@@ -507,6 +622,8 @@ def main() -> None:
         dropout=float(model_cfg.get("dropout", 0.1)),
         final_bn_affine=bool(model_cfg.get("final_bn_affine", False)),
     ).to(device)
+    if channels_last:
+        model = model.to(memory_format=torch.channels_last)
     criterion = HardNetLoss(
         margin=float(train_cfg.get("margin", 1.0)),
         hard_negative_strategy=str(train_cfg.get("hard_negative_strategy", "same_finger_allowed")),
@@ -535,7 +652,9 @@ def main() -> None:
         f"hard_negative_strategy={train_cfg.get('hard_negative_strategy', 'same_finger_allowed')} "
         f"hard_negative_top_k={train_cfg.get('hard_negative_top_k', 3)} "
         f"scheduler={scheduler} warmup_epochs={warmup_epochs} eta_min={eta_min} "
-        f"early_stop_patience={early_stop_patience} early_stop_min_delta={early_stop_min_relative}",
+        f"early_stop_patience={early_stop_patience} early_stop_min_delta={early_stop_min_relative} "
+        f"mixed_precision={train_cfg.get('mixed_precision', 'fp16') if amp_enabled else 'fp32'} "
+        f"channels_last={channels_last}",
         flush=True,
     )
 
@@ -548,7 +667,14 @@ def main() -> None:
         if not resume_path.is_absolute():
             resume_path = (Path.cwd() / resume_path).resolve()
         if resume_path.exists():
-            start_epoch, global_step = load_checkpoint(resume_path, model, optimizer, device, steps_per_epoch)
+            start_epoch, global_step = load_checkpoint(
+                resume_path,
+                model,
+                optimizer,
+                device,
+                steps_per_epoch,
+                scaler=scaler,
+            )
             print(f"resumed from {resume_path} | start_epoch={start_epoch} global_step={global_step}", flush=True)
         elif args.resume_auto or resume_arg == "auto":
             print(f"resume auto skipped: checkpoint not found at {resume_path}", flush=True)
@@ -573,13 +699,43 @@ def main() -> None:
             warmup_steps=warmup_steps,
             eta_min=eta_min,
             log_interval=int(train_cfg.get("log_interval", 50)),
+            scaler=scaler,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+            channels_last=channels_last,
         )
-        val_metrics = evaluate(model, criterion, val_loader, device)
-        save_checkpoint(output_dir / "last.pt", model, optimizer, config, epoch, global_step, val_metrics)
+        val_metrics = evaluate(
+            model,
+            criterion,
+            val_loader,
+            device,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+            channels_last=channels_last,
+        )
+        save_checkpoint(
+            output_dir / "last.pt",
+            model,
+            optimizer,
+            config,
+            epoch,
+            global_step,
+            val_metrics,
+            scaler=scaler,
+        )
         # FPR95 越低越好，因此用它选择 best checkpoint。
         if val_metrics["fpr95"] <= best_fpr95:
             best_fpr95 = val_metrics["fpr95"]
-            save_checkpoint(output_dir / "best.pt", model, optimizer, config, epoch, global_step, val_metrics)
+            save_checkpoint(
+                output_dir / "best.pt",
+                model,
+                optimizer,
+                config,
+                epoch,
+                global_step,
+                val_metrics,
+                scaler=scaler,
+            )
 
         # 早停规则：
         #   只有当 val_fpr95 相比早停历史 best 至少相对下降 min_delta 时，
