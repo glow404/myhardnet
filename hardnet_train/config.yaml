@@ -32,7 +32,7 @@ training:
   # 卷积前向使用 FP16，hardest-negative 距离矩阵和 loss 仍使用 FP32。
   mixed_precision: fp16
   channels_last: true
-  cudnn_benchmark: true
+  cudnn_benchmark: false
   allow_tf32: true
   # 指纹数据比 Brown patch 更难，最大训练 100 epoch，并支持从 last.pt 续训。
   epochs: 500

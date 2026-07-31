@@ -167,7 +167,7 @@ def configure_cuda(device: torch.device, train_cfg: dict[str, Any]) -> None:
 
     if device.type != "cuda":
         return
-    torch.backends.cudnn.benchmark = bool(train_cfg.get("cudnn_benchmark", True))
+    torch.backends.cudnn.benchmark = False
     allow_tf32 = bool(train_cfg.get("allow_tf32", True))
     torch.backends.cuda.matmul.allow_tf32 = allow_tf32
     torch.backends.cudnn.allow_tf32 = allow_tf32

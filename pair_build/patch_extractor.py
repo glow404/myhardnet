@@ -3,7 +3,7 @@
 作用：
 - 读取 build_positive 阶段生成的 all_positive_pairs.csv。
 - 根据 CSV 中的 keypoint 坐标和方向，从原始小图中裁剪正样本 patch 对。
-- 按配置裁剪并输出 HardNet 需要的单通道 PNG；当前默认配置为直接裁 32x32。
+- 使用共享的局部仿射采样器一次性生成方向对齐 patch，训练和推理保持同一坐标语义。
 - 将成功落盘的 patch 路径写回 all_positive_pairs.csv，并拆分出
   train_pairs.csv / val_pairs.csv / test_pairs.csv。
 
@@ -22,13 +22,18 @@ from __future__ import annotations
 import csv
 import logging
 import os
+import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
-import cv2
 import numpy as np
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from patch_sampling import extract_local_affine_patch, overlap_ratio
 from positive_builder import POSITIVE_FIELDNAMES
 from utils import ensure_dir, get_nested, imread_grayscale, imwrite_image, resolve_path, sanitize_token, stable_id, write_json
 
@@ -69,39 +74,23 @@ def _load_image(path: str, cache: dict[str, np.ndarray | None]) -> np.ndarray | 
 
 
 def _overlap_ratio(image_shape: tuple[int, int], x: float, y: float, crop_size: int) -> float:
-    """计算裁剪框与原图的有效重叠比例。
+    """计算裁剪窗口与原图的有效重叠比例。"""
 
-    patch 中央点靠近边缘时，旋转裁剪会产生黑边。这个比例用于提前过滤严重越界样本。
-    """
-
-    height, width = image_shape
-    half = crop_size / 2.0
-    x0, y0, x1, y1 = x - half, y - half, x + half, y + half
-    ix0, iy0 = max(0.0, x0), max(0.0, y0)
-    ix1, iy1 = min(float(width), x1), min(float(height), y1)
-    inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
-    return inter / max(float(crop_size * crop_size), 1.0)
+    return overlap_ratio(image_shape, x, y, crop_size)
 
 
 def _extract_aligned_patch(image: np.ndarray, x: float, y: float, angle: float, crop_size: int, out_size: int) -> np.ndarray:
-    """按 keypoint 方向旋转对齐后裁剪 patch。
+    """通过共享局部仿射采样器提取方向对齐 patch。"""
 
-    先围绕关键点旋转整张小图，再用 getRectSubPix 取局部窗口。
-    这样 patch 内的主方向更一致，HardNet 不必把大量容量浪费在旋转变化上。
-    """
-
-    height, width = image.shape[:2]
-    matrix = cv2.getRotationMatrix2D((float(x), float(y)), float(angle), 1.0)
-    rotated = cv2.warpAffine(
+    return extract_local_affine_patch(
         image,
-        matrix,
-        dsize=(width, height),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
+        x=x,
+        y=y,
+        angle=angle,
+        crop_size=crop_size,
+        out_size=out_size,
     )
-    patch = cv2.getRectSubPix(rotated, patchSize=(int(crop_size), int(crop_size)), center=(float(x), float(y)))
-    return cv2.resize(patch, (int(out_size), int(out_size)), interpolation=cv2.INTER_AREA)
+
 
 
 def _patch_metrics(patch: np.ndarray, blank_threshold: int) -> dict[str, float]:
@@ -128,8 +117,8 @@ def _validate_and_extract(image: np.ndarray | None, x: float, y: float, angle: f
 
     if image is None:
         return None, {"ok": False, "reason": "image_read_failed"}
-    crop_size = int(get_nested(config, "patch", "patch_crop_size", default=64))
-    out_size = int(get_nested(config, "patch", "patch_out_size", default=32))
+    crop_size = int(get_nested(config, "patch", "crop_size", default=get_nested(config, "patch", "patch_crop_size", default=32)))
+    out_size = int(get_nested(config, "patch", "out_size", default=get_nested(config, "patch", "patch_out_size", default=32)))
     min_overlap = float(get_nested(config, "patch", "min_overlap_ratio", default=0.55))
     blank_threshold = int(get_nested(config, "patch", "blank_threshold", default=8))
     max_blank = float(get_nested(config, "patch", "max_blank_ratio", default=0.55))

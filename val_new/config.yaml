@@ -31,7 +31,8 @@ sift:
   blur_sigma: 0.8
 
 patch:
-  crop_size: 64
+  # 与 pair_build 和 match_new 一致：局部仿射一次采样，直接生成 32x32 patch。
+  crop_size: 32
   out_size: 32
   normalize: true
   min_overlap_ratio: 0.55

@@ -172,10 +172,10 @@ matching:
 
 # patch 裁剪与过滤配置。
 patch:
-  # 直接在原图中裁 32x32，输出仍为 32x32，贴合原版 HardNet 输入。
-  # 这样避免 64->32 压缩，同时降低靠边裁剪产生黑边的概率。
-  patch_crop_size: 32
-  patch_out_size: 32
+  # 路线 2：局部仿射一次采样，直接生成 HardNet 的 32x32 输入。
+  # 训练、注册、在线 query 和验证都通过项目根目录的 patch_sampling.py 使用同一实现。
+  crop_size: 32
+  out_size: 32
 
   # 裁剪框与原图有效重叠比例下限。过低说明越界严重。
   min_overlap_ratio: 0.80

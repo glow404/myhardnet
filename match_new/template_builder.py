@@ -185,7 +185,7 @@ def build_hardnet_template_from_image(
     selected_keypoints, patches, _selected_indices = extract_keypoint_patches(
         image,
         keypoints,
-        crop_size=int(patch_cfg.get("crop_size", 64)),
+        crop_size=int(patch_cfg.get("crop_size", 32)),
         out_size=int(patch_cfg.get("out_size", 32)),
         min_overlap_ratio=float(patch_cfg.get("min_overlap_ratio", 0.55)),
         normalize=bool(patch_cfg.get("normalize", True)),

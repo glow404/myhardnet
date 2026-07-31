@@ -3,7 +3,7 @@
 本模块只提供注册和在线解锁都需要的底层能力：
     1. 读取原始灰度指纹图像；
     2. 创建 SIFT 检测器并提取关键点；
-    3. 按训练阶段相同的方向裁剪并归一化 patch；
+    3. 按统一的局部仿射采样器生成方向对齐 patch；
     4. 加载 HardNet checkpoint，并在 CPU 或 CUDA 上批量生成描述子。
 
 这里不包含阈值扫描、ROC/FAR/FRR 计算或算法对照实验。工程匹配代码因此不再
@@ -22,6 +22,7 @@ import torch
 
 from hardnet_train.model import HardNet
 from match_new.utils import resolve_path
+from patch_sampling import patchable_keypoints
 
 
 def get_nested(
@@ -135,144 +136,10 @@ def detect_sift_keypoints(
     return list(sift.detect(processed, None) or [])
 
 
-def overlap_ratio(
-    image_shape: tuple[int, int],
-    x: float,
-    y: float,
-    crop_size: int,
-) -> float:
-    """计算未旋转裁剪窗口落在原图内部的面积比例。"""
-
-    height, width = image_shape
-    half = crop_size / 2.0
-    x0, y0, x1, y1 = x - half, y - half, x + half, y + half
-    ix0, iy0 = max(0.0, x0), max(0.0, y0)
-    ix1, iy1 = min(float(width), x1), min(float(height), y1)
-    intersection = (
-        max(0.0, ix1 - ix0)
-        * max(0.0, iy1 - iy0)
-    )
-    return intersection / max(float(crop_size * crop_size), 1.0)
-
-
-def extract_aligned_patch(
-    image: np.ndarray,
-    keypoint: cv2.KeyPoint,
-    crop_size: int,
-    out_size: int,
-) -> np.ndarray:
-    """按关键点方向旋转原图，再裁剪与训练阶段一致的局部 patch。
-
-    当前保留已有模型使用的旧裁剪语义。后续若切换成直接局部仿射采样，必须让
-    训练数据生成和本函数同时切换，并重新训练模型、标定阈值。
-    """
-
-    x, y = keypoint.pt
-    angle = float(keypoint.angle if keypoint.angle >= 0 else 0.0)
-    height, width = image.shape[:2]
-    matrix = cv2.getRotationMatrix2D(
-        (float(x), float(y)),
-        angle,
-        1.0,
-    )
-    rotated = cv2.warpAffine(
-        image,
-        matrix,
-        dsize=(width, height),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    )
-    patch = cv2.getRectSubPix(
-        rotated,
-        patchSize=(int(crop_size), int(crop_size)),
-        center=(float(x), float(y)),
-    )
-    return cv2.resize(
-        patch,
-        (int(out_size), int(out_size)),
-        interpolation=cv2.INTER_AREA,
-    )
-
-
-def normalize_patch(
-    patch: np.ndarray,
-    normalize: bool = True,
-) -> np.ndarray:
-    """把灰度 patch 转为 HardNet 输入，并执行单 patch 标准化。"""
-
-    values = patch.astype(np.float32)
-    if not normalize:
-        return values / 255.0
-    std = max(float(values.std()), 1e-6)
-    return (values - float(values.mean())) / std
-
-
-def patchable_keypoints(
-    image: np.ndarray,
-    keypoints: list[cv2.KeyPoint],
-    config: Mapping[str, Any],
-) -> tuple[list[cv2.KeyPoint], np.ndarray, list[int]]:
-    """过滤严重越界的关键点，并构建与关键点行号对齐的 patch 数组。"""
-
-    crop_size = int(
-        get_nested(config, "patch", "crop_size", default=64)
-    )
-    out_size = int(
-        get_nested(config, "patch", "out_size", default=32)
-    )
-    min_overlap = float(
-        get_nested(config, "patch", "min_overlap_ratio", default=0.55)
-    )
-    normalize = bool(
-        get_nested(config, "patch", "normalize", default=True)
-    )
-    selected_keypoints: list[cv2.KeyPoint] = []
-    selected_indices: list[int] = []
-    patches: list[np.ndarray] = []
-    for index, keypoint in enumerate(keypoints):
-        x, y = keypoint.pt
-        if (
-            overlap_ratio(
-                image.shape[:2],
-                float(x),
-                float(y),
-                crop_size,
-            )
-            < min_overlap
-        ):
-            continue
-        patches.append(
-            normalize_patch(
-                extract_aligned_patch(
-                    image,
-                    keypoint,
-                    crop_size=crop_size,
-                    out_size=out_size,
-                ),
-                normalize=normalize,
-            )
-        )
-        selected_keypoints.append(keypoint)
-        selected_indices.append(index)
-    if not patches:
-        return (
-            [],
-            np.zeros((0, out_size, out_size), dtype=np.float32),
-            [],
-        )
-    return (
-        selected_keypoints,
-        np.stack(patches).astype(np.float32),
-        selected_indices,
-    )
-
-
 class HardNetDescriptor:
     """工程注册和在线解锁共用的 HardNet 批量推理器。
 
-    CUDA 模式支持 FP16/BF16 autocast、channels-last、锁页内存异步传输和
-    cuDNN benchmark。所有 batch 在 GPU 上拼接后只回传一次，减少同步次数。
+    CUDA 模式支持 FP16/BF16 autocast、channels-last 和锁页内存异步传输。
     """
 
     def __init__(self, config: Mapping[str, Any]) -> None:
@@ -411,16 +278,10 @@ class HardNetDescriptor:
     ) -> None:
         """配置只在 CUDA 模式生效的 cuDNN 和 TF32 选项。"""
 
+        torch.backends.cudnn.benchmark = False
         if self.device.type != "cuda":
             return
-        torch.backends.cudnn.benchmark = bool(
-            get_nested(
-                config,
-                "model",
-                "cudnn_benchmark",
-                default=True,
-            )
-        )
+        # 关键点数量会改变 HardNet 的 batch 形状；关闭 autotune，避免新形状触发算法搜索长尾。
         allow_tf32 = bool(
             get_nested(
                 config,

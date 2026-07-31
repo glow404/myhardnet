@@ -45,6 +45,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from hardnet_train.model import HardNet
+from patch_sampling import patchable_keypoints
 
 
 @dataclass
@@ -300,76 +301,6 @@ def detect_rootsift(image: np.ndarray, sift: cv2.SIFT, config: Mapping[str, Any]
     return keypoints, descriptors
 
 
-def overlap_ratio(image_shape: tuple[int, int], x: float, y: float, crop_size: int) -> float:
-    """计算 HardNet 裁剪窗口落在原图内的比例。"""
-
-    height, width = image_shape
-    half = crop_size / 2.0
-    x0, y0, x1, y1 = x - half, y - half, x + half, y + half
-    ix0, iy0 = max(0.0, x0), max(0.0, y0)
-    ix1, iy1 = min(float(width), x1), min(float(height), y1)
-    inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
-    return inter / max(float(crop_size * crop_size), 1.0)
-
-
-def extract_aligned_patch(image: np.ndarray, keypoint: cv2.KeyPoint, crop_size: int, out_size: int) -> np.ndarray:
-    """按训练阶段相同的 keypoint 方向旋转并裁剪 patch。"""
-
-    x, y = keypoint.pt
-    angle = float(keypoint.angle if keypoint.angle >= 0 else 0.0)
-    height, width = image.shape[:2]
-    # 必须与 pair_build.patch_extractor._extract_aligned_patch 保持一致；
-    # HardNet 训练 patch 使用正的 keypoint angle 旋转。
-    matrix = cv2.getRotationMatrix2D((float(x), float(y)), angle, 1.0)
-    rotated = cv2.warpAffine(
-        image,
-        matrix,
-        dsize=(width, height),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    )
-    patch = cv2.getRectSubPix(rotated, patchSize=(int(crop_size), int(crop_size)), center=(float(x), float(y)))
-    return cv2.resize(patch, (int(out_size), int(out_size)), interpolation=cv2.INTER_AREA)
-
-
-def normalize_patch(patch: np.ndarray, normalize: bool = True) -> np.ndarray:
-    """HardNet 输入归一化。"""
-
-    patch = patch.astype(np.float32)
-    if not normalize:
-        return patch / 255.0
-    std = max(float(patch.std()), 1e-6)
-    return (patch - float(patch.mean())) / std
-
-
-def patchable_keypoints(
-    image: np.ndarray,
-    keypoints: list[cv2.KeyPoint],
-    config: Mapping[str, Any],
-) -> tuple[list[cv2.KeyPoint], np.ndarray, list[int]]:
-    """筛选能正常裁剪 HardNet patch 的 keypoints，并返回 patch 数组。"""
-
-    crop_size = int(get_nested(config, "patch", "crop_size", default=64))
-    out_size = int(get_nested(config, "patch", "out_size", default=32))
-    min_overlap = float(get_nested(config, "patch", "min_overlap_ratio", default=0.55))
-    normalize = bool(get_nested(config, "patch", "normalize", default=True))
-    selected_keypoints: list[cv2.KeyPoint] = []
-    selected_indices: list[int] = []
-    patches: list[np.ndarray] = []
-    for index, keypoint in enumerate(keypoints):
-        x, y = keypoint.pt
-        if overlap_ratio(image.shape[:2], float(x), float(y), crop_size) < min_overlap:
-            continue
-        patch = extract_aligned_patch(image, keypoint, crop_size=crop_size, out_size=out_size)
-        patches.append(normalize_patch(patch, normalize=normalize))
-        selected_keypoints.append(keypoint)
-        selected_indices.append(index)
-    if not patches:
-        return [], np.zeros((0, out_size, out_size), dtype=np.float32), []
-    return selected_keypoints, np.stack(patches).astype(np.float32), selected_indices
-
-
 def keypoints_to_points(keypoints: Sequence[cv2.KeyPoint]) -> np.ndarray:
     """把 keypoints 转成 RANSAC 坐标数组。"""
 
@@ -384,6 +315,7 @@ class HardNetDescriptor:
     def __init__(self, config: Mapping[str, Any]) -> None:
         self.device = choose_device(str(get_nested(config, "model", "device", default="auto")))
         self.batch_size = int(get_nested(config, "model", "batch_size", default=512))
+        torch.backends.cudnn.benchmark = False
         checkpoint_path = resolve_path(config, get_nested(config, "model", "checkpoint"))
         self.model = HardNet(
             dropout=float(get_nested(config, "model", "dropout", default=0.1)),

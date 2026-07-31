@@ -58,7 +58,7 @@ model:
   inference_precision: fp16
   channels_last: true
   pin_memory: true
-  cudnn_benchmark: true
+  cudnn_benchmark: false
   allow_tf32: true
 
 sift:
@@ -77,7 +77,7 @@ sift:
   blur_sigma: 0.8
 
 patch:
-  # 重要：这里和 pair_build/config.yaml 对齐，当前训练 patch 是直接裁 32x32，
+  # 路线 2：训练、注册和在线 query 统一使用局部仿射一次采样。
   crop_size: 32
   out_size: 32
 
