@@ -11,7 +11,7 @@
 output:
   # 实验结果根目录。相对路径相对本配置文件所在目录解析。
   # 其下会生成 image_templates/、eval_hardnet_l2/、各类 CSV/JSON 等。
-  output_dir: ysjz_V4
+  output_dir: ../outputs/ysjz_V4_21_lr10+模板数40
 
 runtime:
   skip_template_build: false
@@ -112,7 +112,7 @@ matching:
 
   # 是否启用双向 Lowe 比值验证。
   # 仅影响 ratio_only 和 topk_or_ratio 的 ratio 分支；topk_only 不使用该参数。
-  bidirectional_ratio_test: false
+  bidirectional_ratio_test: true
 
   # 绝对距离上限。最近邻距离仍必须不超过该值
   abs_distance_threshold: 1.5
@@ -123,7 +123,7 @@ matching:
 
   # RANSAC 前允许一对多候选，避免局部纹理重复时过早删掉真匹配；
   # RANSAC 后再做 one-to-one 去重。  开启双向验证时，这个参数不起作用。
-  allow_many_to_one_before_ransac: true
+  allow_many_to_one_before_ransac: false
 
   # 候选过多会拖慢 RANSAC，也容易引入噪声，所以进入 RANSAC 前截断。
   max_candidates_for_ransac: 300
@@ -145,8 +145,8 @@ matching:
 
   # 指纹图像主要是平移/旋转，只有极少量尺度变化。
   # RANSAC 得到 partial affine 后，只约束 scale，不限制旋转角。
-  min_scale: 0.90
-  max_scale: 1.10
+  min_scale: 0.80
+  max_scale: 1.20
 
 texture_verification:
   # C 方案：先用几何内点保证仿射可用，再融合几何分数和局部脊线纹理分数。
@@ -174,7 +174,7 @@ texture_verification:
 
 enrollment:
   # 每个手指随机选多少张图作为模板库。
-  enrollment_images_per_identity: 20
+  enrollment_images_per_identity: 40
   selection_strategy: random
 
   # 注册/query 划分随机种子。固定后多次实验可复现。
