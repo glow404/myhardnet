@@ -111,33 +111,31 @@ def build_learning_evidence(
     texture = float(match_result.get("texture_similarity", 0.0))
     common_ratio = float(common_area.get("common_area_ratio", 0.0))
     common_pixels = int(common_area.get("common_pixels", 0))
-    common_ok = bool(common_area.get("available", False)) and common_ratio >= float(
-        config.get("min_common_area_ratio", 0.35)
-    ) and common_pixels >= int(config.get("min_common_area_pixels", 256))
-    confirmation_ok = (
-        score >= float(config.get("confirm_score_threshold", 0.70))
-        and texture_available
-        and common_ok
+    min_common_pixels = max(0, int(config.get("min_common_area_pixels", 256)))
+    max_common_ratio = float(config.get("max_common_area_ratio", 0.35))
+    if max_common_ratio < 0.0 or max_common_ratio > 1.0:
+        raise ValueError(
+            "template_management.max_common_area_ratio must be in [0,1], "
+            f"got {max_common_ratio}"
+        )
+    low_overlap_ok = (
+        bool(common_area.get("available", False))
+        and common_pixels >= min_common_pixels
+        and common_ratio <= max_common_ratio
     )
-    strict_ok = (
+    learning_ok = (
         score >= float(config.get("learn_score_threshold", 0.85))
-        and unique >= int(config.get("learn_min_unique_inliers", 12))
-        and texture_available
-        and texture >= float(config.get("learn_min_texture_similarity", 0.75))
-        and common_ok
+        and low_overlap_ok
     )
     return {
         "template_path": str(entry.get("template_path", "")),
         "template_source": str(entry.get("source", "seed")),
         "protected": bool(entry.get("protected", False)),
         "score": score,
-        "unique_inliers": unique,
-        "texture_available": texture_available,
-        "texture_similarity": texture,
         "common_area_ratio": common_ratio,
         "common_pixels": common_pixels,
-        "confirmation_ok": confirmation_ok,
-        "strict_learning_ok": strict_ok,
+        "low_overlap_ok": low_overlap_ok,
+        "learning_ok": learning_ok,
     }
 
 
@@ -147,28 +145,25 @@ def evaluate_learning_decision(
     duplicate_content: bool,
     config: dict[str, Any],
 ) -> dict[str, Any]:
-    """根据全部可信模板证据给出最终学习准入结论。"""
+    """分数达到阈值且有效公共区域率较低时准入；重复内容始终拒绝。"""
 
-    confirmations = [item for item in evidences if bool(item.get("confirmation_ok", False))]
-    strict = [item for item in evidences if bool(item.get("strict_learning_ok", False))]
-    seed_confirmations = [item for item in confirmations if str(item.get("template_source", "")) == "seed"]
-    required = max(1, int(config.get("confirmation_templates", 2)))
-    require_seed = bool(config.get("require_seed_confirmation", True))
+    eligible = [item for item in evidences if bool(item.get("learning_ok", False))]
     reasons: list[str] = []
     if duplicate_content:
         reasons.append("duplicate_template_content")
-    if not strict:
-        reasons.append("no_strict_high_confidence_match")
-    if len(confirmations) < required:
-        reasons.append("insufficient_template_confirmations")
-    if require_seed and not seed_confirmations:
-        reasons.append("missing_seed_confirmation")
+    if not eligible:
+        reasons.append("no_high_score_low_overlap_match")
     return {
         "accepted": not reasons,
         "reasons": reasons or ["accepted"],
-        "num_confirmations": len(confirmations),
-        "num_seed_confirmations": len(seed_confirmations),
-        "num_strict_matches": len(strict),
+        "num_confirmations": len(eligible),
+        "num_seed_confirmations": sum(
+            str(item.get("template_source", "")) == "seed" for item in eligible
+        ),
+        "num_strict_matches": len(eligible),
         "best_score": max((float(item.get("score", 0.0)) for item in evidences), default=0.0),
-        "best_common_area_ratio": max((float(item.get("common_area_ratio", 0.0)) for item in evidences), default=0.0),
+        "best_common_area_ratio": min(
+            (float(item.get("common_area_ratio", 1.0)) for item in eligible),
+            default=1.0,
+        ),
     }

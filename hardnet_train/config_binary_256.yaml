@@ -1,0 +1,257 @@
+# 256-bit residual binary fingerprint descriptor 训练配置。
+#
+# 运行位置：项目根目录 myhardnet。
+# 正式命令：
+#   python -m hardnet_train.train_binary --config hardnet_train/config_binary_256.yaml
+#
+# 训练前必须满足：
+#   1. data.train_csv / data.val_csv 已由 pair_build 生成，且引用的 patch PNG 可读取；
+#   2. train/val 按 finger_id 隔离，同一手指不能跨集合；
+#   3. backbone.checkpoint 存在，并且是浮点描述子训练产生的 float/L2 checkpoint；
+#   4. output_dir 是新的实验目录；已有 metrics.csv 时必须显式续训，程序不会覆盖；
+#   5. 使用 device=cuda 时，当前 PyTorch 必须支持 CUDA。
+#
+# 二值训练不会修改浮点 teacher checkpoint。它在 teacher 后增加 residual hash head，
+# 输出 0/1 bit code，使用归一化 Hamming 距离；match_new 可直接加载对应 checkpoint。
+
+# 控制数据采样、hash head 初始化和固定验证计划的随机性。
+seed: 42
+
+# 二值实验必须与浮点实验分开保存。
+# 相对路径统一相对于本配置文件所在目录 hardnet_train 解析。
+output_dir: ../outputs/models/hardnet_binary_256float_512bit_fixed_candidate_pool_v3
+
+data:
+  # 二值 student 与浮点 teacher 必须使用相同的 patch/正样本数据契约。
+  # 这两个 CSV 与正式浮点配置 config.yaml 保持一致。
+  train_csv: ../outputs/butieping/train_pairs.csv
+  val_csv: ../outputs/butieping/val_pairs.csv
+
+  # true：把灰度 patch 映射到训练网络使用的标准化输入范围。
+  normalize: true
+
+  # 与浮点训练使用相同的轻微在线增强。仅训练集启用，验证集不增强；
+  # anchor/positive 独立采样扰动，增强二值码对定位和成像误差的鲁棒性。
+  train_augmentation:
+    enabled: true
+    probability: 0.80
+    max_rotation_degrees: 5.0
+    max_translation_pixels: 1.0
+    scale_jitter: 0.03
+    contrast_jitter: 0.10
+    gamma_jitter: 0.10
+    blur_probability: 0.15
+    max_blur_radius: 0.40
+    noise_probability: 0.25
+    max_noise_std: 2.0
+
+  # Windows DataLoader worker 数。若出现 worker 启动、卡死或文件句柄错误，先设为 0。
+  num_workers: 4
+
+  # true 会使用 page-locked CPU 内存加快 CPU→CUDA 拷贝，但会增加常驻内存。
+  # 当前 Windows 环境先保持 false，以稳定性优先。
+  pin_memory: false
+
+  # 仅 num_workers > 0 时生效；跨 epoch 保留 worker，减少重复启动开销。
+  persistent_workers: true
+
+  # 每个 worker 预取的 batch 数；调大可减少 GPU 等待，但增加 CPU 内存和磁盘压力。
+  prefetch_factor: 2
+
+  # 留空表示读取全部记录。只建议在临时排查数据问题时设置上限。
+  max_train_rows:
+  max_val_rows:
+
+  # 留空表示每根手指不额外截断。设置后会限制单根手指参与的数据量。
+  max_train_rows_per_finger:
+  max_val_rows_per_finger:
+
+backbone:
+  # 必填：已经训练完成的浮点/L2 teacher。
+  # 程序会拒绝 binary/Hamming checkpoint，并校验架构和描述子维度。
+  # 必须使用本次轻量 Strong V2 重新训练得到的 checkpoint；旧 Strong V2 权重不兼容。
+  checkpoint: ../outputs/models/hardnet_train_strong_v2_256_fixed_candidate_pool_v3/best.pt
+
+  # auto：直接采用 checkpoint 中记录的真实网络架构，避免手工配置不一致。
+  architecture: auto
+
+  # auto：直接采用 checkpoint 中记录的浮点描述子维度。
+  # Strong V2 通常是 256；该值不要求等于 binary_model.hash_bits。
+  descriptor_dim: auto
+
+binary_model:
+  # 最终二值描述子的 bit 数。必须是 [8, 512] 内的 8 的倍数。
+  # 256 bit 打包后每个局部描述子占 32 byte。
+  hash_bits: 512
+
+  # residual hash head 的隐藏层宽度倍率。
+  # 2.0 表示 256 bit 时隐藏层宽度为 512。
+  hidden_multiplier: 2.0
+
+  # hash head 的 dropout；范围 [0, 1)。过大会削弱 bit 稳定性。
+  dropout: 0.10
+
+  # tanh 量化温度按总训练 step 指数退火：1.0 → 0.10。
+  # 开始温度较高时梯度平滑；结束温度较低时输出更接近 sign。
+  temperature_start: 1.0
+  temperature_end: 0.10
+
+  # false：冻结浮点 backbone，只训练 hash head，作为默认且更稳定的第一阶段。
+  # true：联合微调 backbone 与 hash head；应复制到新输出目录并显著降低学习率。
+  backbone_trainable: false
+
+  # bit 打包到 uint8 时的位序。训练、模板存储和 Hamming runtime 必须一致。
+  bitorder: little
+
+binary_loss:
+  # Hamming 排序代理损失权重。训练时使用归一化 {-1,+1} code 的 L2 排序；
+  # 该排序与 Hamming 距离单调一致，是主要判别目标。
+  metric_weight: 1.0
+
+  # 保持 student batch 内两两相似度接近浮点 teacher，降低量化造成的结构破坏。
+  teacher_similarity_weight: 0.50
+
+  # 拉近一对正样本的连续 hash 表示，增强同一点二值码一致性。
+  positive_consistency_weight: 0.10
+
+  # 推动连续 tanh 输出的绝对值接近 1，减少部署时 sign 量化误差。
+  quantization_weight: 0.10
+
+  # 推动每个 bit 在 batch 内接近正负均衡，降低恒 0/恒 1 bit 的概率。
+  balance_weight: 0.02
+
+  # 惩罚 bit 间协方差，减少多个 bit 学到重复方向。
+  decorrelation_weight: 0.02
+
+  # 所有损失权重必须 >= 0，且至少一个权重大于 0。
+
+training:
+  # cuda：明确要求 GPU；若 CUDA 不可用会直接失败，不会静默回退 CPU。
+  device: cuda
+
+  # 卷积/hash head 前向使用 FP16，组合损失和关键距离计算保持 FP32。
+  mixed_precision: fp16
+
+  # CUDA 卷积使用 channels-last 内存布局；CPU 训练时不会启用。
+  channels_last: true
+
+  # 输入形状和数据访问存在变化，关闭自动卷积算法搜索以避免 Windows 下反复调优。
+  cudnn_benchmark: false
+
+  # 允许 Ampere 及更新 GPU 使用 TF32 加速 FP32 矩阵运算。
+  allow_tf32: true
+
+  # 总训练预算 = epochs × steps_per_epoch。
+  epochs: 150
+  steps_per_epoch: 1000
+
+  # 每 step 的正样本对数量。hard-negative 距离矩阵近似按 batch_size² 增长；
+  # CUDA OOM 时首先减小此值。
+  batch_size: 256
+
+  # 每个训练 batch 尽量包含的手指数；必须 >= 1 且不能超过 batch_size。
+  # 多手指 batch 才能稳定产生 cross-finger negative。
+  fingers_per_batch: 32
+
+  # same_finger_allowed：允许合法同指负样本，同时屏蔽相同 point_group 和近邻点。
+  # different_finger：只允许不同 finger_id 的负样本，要求 batch 中至少两根手指。
+  hard_negative_strategy: same_finger_allowed
+
+  # 同指、同一原图坐标系内，候选需满足 max(|dx|, |dy|) >= 16 才可作为负样本。
+  same_finger_min_coordinate_separation_px: 16
+
+  # 每个 anchor 从双向合法候选中选择的最难负样本数；候选不足时按实际数量使用。
+  hard_negative_top_k: 3
+
+  # 最近的 top-1 难负样本占 60% 权重，其余有效 top-k 候选均分剩余权重。
+  # 显式配置，避免二值训练静默使用 HardNetLoss 的代码默认值。
+  hard_negative_top1_weight: 0.60
+
+  # 二值模型已有 positive_consistency_loss，因此正样本尾部项从浮点训练的 0.10
+  # 降为 0.05，避免两项正样本约束叠加过强。
+  positive_tail_loss_weight: 0.05
+  positive_tail_p95_weight: 0.70
+  positive_tail_p99_weight: 0.30
+
+  # 目标作用于单位化 {-1,+1} code 的 L2 距离。由 d=2*sqrt(hamming_ratio)，
+  # 0.60/0.80 分别约等于 9%/16% 的正样本 bit 差异比例。
+  positive_tail_p95_target: 0.60
+  positive_tail_p99_target: 0.80
+
+  # 二值 metric loss 的 triplet margin。这里作用于归一化 {-1,+1} code 的 L2 距离，
+  # 不是 validation.margin 使用的归一化 Hamming 距离。
+  margin: 0.50
+
+  # 对可训练参数执行全局梯度裁剪；<= 0 时相当于关闭。
+  grad_clip_norm: 5.0
+
+  # 0 表示关闭早停。大于 0 时按 val_checkpoint_selection_score 判断是否改善。
+  early_stop_patience: 0
+
+  # 综合选择分数需要达到的相对提升比例；0.002 表示至少提升 0.2%。
+  early_stop_min_relative_improvement: 0.002
+
+  # warmup_cosine：预热后余弦衰减；也可使用 linear。
+  scheduler: warmup_cosine
+
+  # 前 2 个 epoch 从接近 0 预热到 optimizer.lr。
+  warmup_epochs: 2
+
+  # 余弦衰减的最低学习率。
+  eta_min: 0.00001
+
+  # 每 50 个训练 step 打印一次运行指标；<= 0 可关闭 step 日志。
+  log_interval: 50
+
+validation:
+  # 固定候选池协议：完整合法候选计算 ROC/FPR，动态 top-k 仅计算排序与 loss。
+  protocol: fixed_candidate_pool_v3
+
+  # 固定验证计划随机种子。修改后验证样本计划会变化，不能直接横向比较旧实验。
+  seed: 10042
+
+  # auto 解析为 min(验证集可用手指数, validation.batch_size)。
+  # 显式整数不能超过验证集可用手指数或 batch_size。
+  finger_count: auto
+
+  # 每个 epoch 执行的固定验证 batch 数。image pair 不足时确定性循环使用；
+  # 增大该值主要增加验证耗时和 CPU 指标缓存，不直接增加单批 GPU 峰值。
+  batch_count: 256
+
+  # 单个验证 batch 的正样本对数量。至少为 2；影响单批 GPU 峰值。
+  batch_size: 32
+
+  # 验证 loss 使用归一化 Hamming 距离 [0, 1]，因此独立于 training.margin。
+  margin: 0.10
+
+checkpoint_selection:
+  # 四项总体验证指标的综合 checkpoint 选择策略；分数越高越好。
+  strategy: matching_composite_v1
+
+  # 权重会自动归一化，总和不强制等于 1；所有值必须非负且总和 > 0。
+  weights:
+    # 动态 hard top-k Hamming margin loss，越低越好。
+    loss: 0.30
+    # 完整合法候选池的 val_neg_mean - val_pos_mean，越高越好。
+    distance_gap: 0.20
+    # 完整合法候选池的 FPR@TPR95，越低越好。
+    fpr_at_tpr95: 0.35
+    # 正样本 Hamming 距离 p95，越低越好。
+    pos_p95: 0.15
+
+optimizer:
+  # AdamW 只更新 requires_grad=true 的参数；默认即 residual hash head。
+  name: adamw
+
+  # 冻结 backbone 时的默认学习率。若 backbone_trainable=true，应使用更小学习率
+  # 并放到新的 output_dir，避免破坏已经训练好的浮点描述子。
+  lr: 0.001
+
+  # decoupled weight decay。
+  weight_decay: 0.0001
+
+  # AdamW 一阶/二阶动量系数。
+  betas: [0.9, 0.999]
+
+  # AdamW 数值稳定项。
+  eps: 1.0e-8

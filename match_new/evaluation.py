@@ -1,14 +1,14 @@
-"""HardNet L2 身份验证评估与失败样本导出。
+"""HardNet 身份验证评估与失败样本导出。
 
 作用：
-    这个脚本负责把“图像级匹配器”扩展成“手机解锁式 identity 级验证实验”：
+    这个脚本负责把“图像级匹配器”扩展成“手机解锁式 identity 级验证实验”。
+    HardNet 模板可使用 float/L2 或 binary/Hamming 描述子，后续评估流程保持一致。
 
-    1. 每个 query 对本人 identity 的 20 张注册模板打分，得到 genuine attempt；
-    2. 同一个 query 对所有非本人 identity 的 20 张注册模板打分，得到 impostor attempts；
-    3. identity 级分数默认取 20 张模板中的最大图像级 score；
-    4. 根据 identity 级 score 计算 FAR、FRR、EER、AUC、TAR@FAR；
-    5. 按目标约束 FAR < 1/50000、FRR < 2% 选择 target_operating_point； todo：这个可以去掉了
-    6. 在该阈值下导出 false reject / false accept 原图和拼接预览图。
+    1. 每个 query 对本人 identity 的注册模板打分，得到 genuine attempt；
+    2. 同一个 query 对非本人 identity 的注册模板打分，得到 impostor attempts；
+    3. identity 级分数默认取注册模板中的最大图像级 score；
+    4. 根据 identity 级 score 计算 FAR、FRR、EER 和 AUC；
+    5. 在配置的解锁阈值下导出 false reject / false accept 原图和拼接预览图。
 
 注意：
     这里所有 FAR/FRR 都是 identity 级 attempt 统计，不是单图对单图统计。
@@ -31,9 +31,25 @@ import numpy as np
 from sklearn.metrics import auc, roc_curve
 from tqdm import tqdm
 
-from match_new.identity_matcher import load_template_cached, score_query_against_identity
+from match_new.identity_matcher import (
+    compute_end_to_end_core_ms,
+    load_template_cached,
+    resolve_early_stop_threshold,
+    score_query_against_identity,
+)
 from match_new.template_builder import load_identity_templates
-from match_new.utils import ensure_dir, read_csv_rows, resolve_path, safe_id, template_filename, write_csv_rows, write_json, write_yaml
+from match_new.template_library import TemplateLibraryManager
+from match_new.utils import (
+    ensure_dir,
+    format_significant_digits,
+    read_csv_rows,
+    resolve_path,
+    safe_id,
+    template_filename,
+    write_csv_rows,
+    write_json,
+    write_yaml,
+)
 
 
 SCORE_FIELDNAMES = [
@@ -47,6 +63,10 @@ SCORE_FIELDNAMES = [
     "accepted_at_selected_threshold",
     "query_image_path",
     "query_template_path",
+    "descriptor_source",
+    "descriptor_kind",
+    "descriptor_metric",
+    "descriptor_dim",
     "best_template_path",
     "best_template_image_id",
     "best_template_image_path",
@@ -57,6 +77,27 @@ SCORE_FIELDNAMES = [
     "best_image_score",
     "best_quality_score",
     "num_raw_matches",
+    "num_abs_distance_pass",
+    "num_one_way_ratio_pass",
+    "num_ratio_pass",
+    "num_queries_with_candidates",
+    "candidate_query_coverage",
+    "templates_with_candidates",
+    "templates_with_abs_distance_pass",
+    "templates_with_ratio_pass",
+    "templates_with_ransac_success",
+    "templates_with_unique_inlier_ready",
+    "templates_with_texture_evaluated",
+    "templates_with_texture_available",
+    "templates_with_fused_score",
+    "max_candidate_query_coverage",
+    "max_num_candidates",
+    "max_raw_inliers",
+    "max_unique_inliers",
+    "max_geometry_similarity",
+    "max_texture_similarity",
+    "ransac_success",
+    "scale_rejected",
     "num_candidates",
     "num_inliers",
     "raw_inliers",
@@ -64,7 +105,9 @@ SCORE_FIELDNAMES = [
     "unique_query_inliers",
     "unique_gallery_inliers",
     "inlier_ratio",
+    "mean_descriptor_distance",
     "mean_l2_distance",
+    "mean_hamming_distance",
     "mean_reproj_error",
     "orientation_consistency",
     "dominant_angle_delta",
@@ -85,6 +128,7 @@ SCORE_FIELDNAMES = [
     "candidate_filter_ms",
     "ransac_ms",
     "inlier_refinement_ms",
+    "unique_inlier_dedup_ms",
     "texture_similarity_ms",
     "score_fusion_ms",
     "postprocess_ms",
@@ -96,6 +140,7 @@ SCORE_FIELDNAMES = [
     "query_template_build_ms",
     "unlock_match_ms",
     "unlock_end_to_end_ms",
+    "unlock_end_to_end_core_ms",
 ]
 
 
@@ -108,6 +153,60 @@ def parse_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def classify_false_reject(
+    row: dict[str, Any],
+    threshold: float,
+    config: dict[str, Any],
+) -> str:
+    """按最早失败阶段分类 genuine identity attempt，不改变任何匹配判定。"""
+
+    def integer(name: str) -> int:
+        value = parse_float(row.get(name))
+        return int(value) if value is not None else 0
+
+    def number(name: str) -> float:
+        value = parse_float(row.get(name))
+        return float(value) if value is not None else 0.0
+
+    matching_cfg = dict(config.get("matching", {}))
+    texture_cfg = dict(config.get("texture_verification", {}))
+    candidate_policy = str(
+        matching_cfg.get("candidate_policy", "topk_or_ratio")
+    ).lower()
+    if integer("templates_with_candidates") == 0:
+        if integer("templates_with_abs_distance_pass") == 0:
+            return "descriptor_distance_reject"
+        if (
+            candidate_policy in {"ratio_only", "topk_or_ratio"}
+            and integer("templates_with_ratio_pass") == 0
+        ):
+            return "ratio_reject"
+        return "candidate_insufficient"
+    if integer("templates_with_ransac_success") == 0:
+        if integer("scale_rejected") > 0:
+            return "ransac_scale_reject"
+        return "ransac_failed"
+
+    low_unique = int(texture_cfg.get("low_unique_inliers", 3))
+    if integer("templates_with_unique_inlier_ready") == 0:
+        return "unique_inlier_insufficient"
+    if bool(texture_cfg.get("enabled", False)):
+        if (
+            integer("templates_with_texture_evaluated") > 0
+            and integer("templates_with_texture_available") == 0
+        ):
+            return "texture_unavailable"
+        if (
+            integer("templates_with_fused_score") > 0
+            and number("max_geometry_similarity") >= threshold
+            and number("score") < threshold
+        ):
+            return "texture_fusion_reject"
+    if float(threshold) - number("score") <= 0.05:
+        return "threshold_edge"
+    return "score_below_threshold"
 
 
 def timing_percentile(values: list[float], q: float) -> float | None:
@@ -189,6 +288,94 @@ def summarize_score_components(score_rows: list[dict[str, str]], threshold: floa
     }
 
 
+def summarize_matching_stages(
+    score_rows: list[dict[str, str]],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """汇总 identity attempt 在候选、RANSAC 和 unique-inlier 阶段的通过率。"""
+
+    low_unique = int(
+        dict(config.get("texture_verification", {})).get(
+            "low_unique_inliers",
+            3,
+        )
+    )
+    groups: dict[str, list[dict[str, str]]] = {"genuine": [], "impostor": []}
+    for row in score_rows:
+        name = "genuine" if int(row.get("label", 0)) == 1 else "impostor"
+        groups[name].append(row)
+
+    def value(row: dict[str, str], name: str) -> float:
+        parsed = parse_float(row.get(name))
+        return float(parsed) if parsed is not None else 0.0
+
+    summary: dict[str, Any] = {
+        "definition": (
+            "attempt 级覆盖率；candidate_ready 表示至少一张注册模板产生候选，"
+            "不是带点对应标注的 descriptor recall@K。"
+        ),
+        "low_unique_inliers": low_unique,
+    }
+    for name, rows in groups.items():
+        count = len(rows)
+        denominator = max(count, 1)
+        summary[name] = {
+            "count": count,
+            "candidate_ready": sum(
+                value(row, "templates_with_candidates") > 0 for row in rows
+            ),
+            "candidate_ready_rate": sum(
+                value(row, "templates_with_candidates") > 0 for row in rows
+            )
+            / denominator,
+            "ratio_ready_rate": sum(
+                value(row, "templates_with_ratio_pass") > 0 for row in rows
+            )
+            / denominator,
+            "ransac_success_rate": sum(
+                value(row, "templates_with_ransac_success") > 0 for row in rows
+            )
+            / denominator,
+            "unique_inlier_ready_rate": sum(
+                value(row, "templates_with_unique_inlier_ready") > 0 for row in rows
+            )
+            / denominator,
+            "texture_available_rate": sum(
+                value(row, "templates_with_texture_available") > 0 for row in rows
+            )
+            / denominator,
+            "fused_score_ready_rate": sum(
+                value(row, "templates_with_fused_score") > 0 for row in rows
+            )
+            / denominator,
+            "mean_best_candidates": sum(
+                value(row, "num_candidates") for row in rows
+            )
+            / denominator,
+            "mean_best_raw_inliers": sum(
+                value(row, "raw_inliers") for row in rows
+            )
+            / denominator,
+            "mean_best_unique_inliers": sum(
+                value(row, "unique_inliers") for row in rows
+            )
+            / denominator,
+            "mean_max_unique_inliers": sum(
+                value(row, "max_unique_inliers") for row in rows
+            )
+            / denominator,
+            "mean_max_candidate_query_coverage": sum(
+                value(row, "max_candidate_query_coverage") for row in rows
+            )
+            / denominator,
+            "mean_best_reprojection_error": sum(
+                value(row, "mean_reproj_error") for row in rows
+            )
+            / denominator,
+        }
+    return summary
+
+
 def select_query_rows(metadata_rows: list[dict[str, str]]) -> list[dict[str, str]]:
     """从 split metadata 中取出 query 图像行。"""
 
@@ -242,133 +429,207 @@ def build_threshold_curve(labels: np.ndarray, scores: np.ndarray, config: dict[s
         count = int(math.ceil(1.0 / step))
         auto = [min(index * step, 1.0) for index in range(count + 1)]
         thresholds.extend(auto)
+    # 网格只用于画曲线，实际分数也必须纳入候选阈值；否则低 FAR 区域可能
+    # 被 0.01 的粗粒度跳过，导致选出的阈值无法精确复现。
+    thresholds.extend(
+        float(score)
+        for score in np.asarray(scores).reshape(-1)
+        if np.isfinite(score)
+    )
     thresholds = sorted({round(value, 10) for value in thresholds if 0.0 <= value <= 1.0})
     return [rate_at_threshold(labels, scores, threshold) for threshold in thresholds]
 
 
-def recommend_unlock_threshold(curve: list[dict[str, Any]], far_points: list[float]) -> dict[str, Any] | None:
-    """旧版推荐阈值逻辑。
+def resolve_far_frr_table_config(config: dict[str, Any]) -> dict[str, float]:
+    """解析固定 FAR/FRR 表格的阈值扫描范围。"""
 
-    优先找 FAR=0 且 FRR 最低的阈值；如果没有 FAR=0，则使用 far_points 中最严格点。
-    保留它是为了和旧 `match/` 实验结果对照。
-    """
-
-    if not curve:
-        return None
-
-    def rate(item: dict[str, Any], key: str, default: float) -> float:
-        value = item.get(key)
-        return default if value is None else float(value)
-
-    zero_far = [item for item in curve if rate(item, "far", 1.0) == 0.0]
-    if zero_far:
-        best = min(zero_far, key=lambda item: (rate(item, "frr", 1.0), float(item["threshold"])))
-        reason = "lowest_frr_at_far_0"
-    else:
-        strict_far = min([float(point) for point in far_points], default=1.0)
-        valid = [item for item in curve if rate(item, "far", 1.0) <= strict_far]
-        if valid:
-            best = min(valid, key=lambda item: (rate(item, "frr", 1.0), float(item["threshold"])))
-            reason = f"lowest_frr_at_far_le_{strict_far}"
-        else:
-            best = min(curve, key=lambda item: (rate(item, "far", 1.0), rate(item, "frr", 1.0), float(item["threshold"])))
-            reason = "lowest_available_far_then_frr"
-    frr = rate(best, "frr", 1.0)
-    return {"threshold": float(best["threshold"]), "far": rate(best, "far", 1.0), "frr": frr, "tar": 1.0 - frr, "reason": reason}
-
-
-def select_target_operating_threshold(curve: list[dict[str, Any]], target_far: float, target_frr: float) -> dict[str, Any] | None:
-    """按正式目标选择操作阈值。
-
-    当前目标为：
-        FAR < 1/50000
-        FRR < 2%
-
-    选择策略：
-        1. 若存在同时满足两项约束的阈值，取其中 FRR 最低者；
-        2. 若只能满足 FAR，则报告“FRR 未达标”并取 FAR 约束内 FRR 最低者；
-        3. 若只能满足 FRR，则报告“FAR 未达标”并取 FRR 约束内 FAR 最低者；
-        4. 若两项都不能满足，取相对违反程度最小的阈值。
-    """
-
-    if not curve:
-        return None
-
-    def rate(item: dict[str, Any], key: str, default: float) -> float:
-        value = item.get(key)
-        return default if value is None else float(value)
-
-    target_far = float(target_far)
-    target_frr = float(target_frr)
-    both_valid = [item for item in curve if rate(item, "far", 1.0) < target_far and rate(item, "frr", 1.0) < target_frr]
-    if both_valid:
-        best = min(both_valid, key=lambda item: (rate(item, "frr", 1.0), float(item["threshold"])))
-        reason = "meets_far_and_frr_targets"
-        satisfied = True
-    else:
-        far_valid = [item for item in curve if rate(item, "far", 1.0) < target_far]
-        if far_valid:
-            best = min(far_valid, key=lambda item: (rate(item, "frr", 1.0), float(item["threshold"])))
-            reason = "frr_target_not_met_under_far_target"
-        else:
-            frr_valid = [item for item in curve if rate(item, "frr", 1.0) < target_frr]
-            if frr_valid:
-                best = min(frr_valid, key=lambda item: (rate(item, "far", 1.0), rate(item, "frr", 1.0), float(item["threshold"])))
-                reason = "far_target_not_met_under_frr_target"
-            else:
-                def violation(item: dict[str, Any]) -> tuple[float, float, float]:
-                    far = rate(item, "far", 1.0)
-                    frr = rate(item, "frr", 1.0)
-                    far_over = max(far - target_far, 0.0) / max(target_far, 1e-12)
-                    frr_over = max(frr - target_frr, 0.0) / max(target_frr, 1e-12)
-                    return far_over + frr_over, frr, float(item["threshold"])
-
-                best = min(curve, key=violation)
-                reason = "no_threshold_meets_either_target"
-        satisfied = False
-
-    far = rate(best, "far", 1.0)
-    frr = rate(best, "frr", 1.0)
+    eval_cfg = dict(config.get("evaluation", {}))
+    table_cfg = dict(eval_cfg.get("far_frr_table", {}))
+    min_threshold = float(table_cfg.get("min_threshold", 0.50))
+    max_threshold = float(table_cfg.get("max_threshold", 0.85))
+    step = float(table_cfg.get("step", 0.01))
+    if not 0.0 <= min_threshold <= max_threshold <= 1.0:
+        raise ValueError(
+            "evaluation.far_frr_table bounds must satisfy "
+            "0 <= min_threshold <= max_threshold <= 1, "
+            f"got min={min_threshold}, max={max_threshold}."
+        )
+    if not 0.0 < step <= 1.0:
+        raise ValueError(
+            f"evaluation.far_frr_table.step must be in (0,1], got {step}."
+        )
     return {
-        "threshold": float(best["threshold"]),
-        "far": far,
-        "frr": frr,
-        "tar": 1.0 - frr,
-        "target_far": target_far,
-        "target_frr": target_frr,
-        "satisfied": bool(satisfied),
-        "reason": reason,
-        "genuine_accept": best.get("genuine_accept"),
-        "genuine_reject": best.get("genuine_reject"),
-        "genuine_total": best.get("genuine_total"),
-        "impostor_accept": best.get("impostor_accept"),
-        "impostor_reject": best.get("impostor_reject"),
-        "impostor_total": best.get("impostor_total"),
+        "min_threshold": min_threshold,
+        "max_threshold": max_threshold,
+        "step": step,
     }
 
 
-def compute_metrics(labels: np.ndarray, scores: np.ndarray, selected_threshold: float, far_points: list[float], curve: list[dict[str, Any]], config: dict[str, Any]) -> dict[str, Any]:
-    """汇总全局指标。
+def far_frr_table_filename(min_threshold: float, max_threshold: float) -> str:
+    """根据阈值范围生成固定 FAR/FRR 表格文件名。"""
 
-    输出包括：
-        - fixed_threshold：历史固定阈值下的 FAR/FRR；
-        - recommended_threshold：旧推荐逻辑；
-        - target_operating_point：按 FAR<1/50000、FRR<2% 找到的正式阈值；
-        - EER / AUC / TAR@FAR。
+    return (
+        f"far_frr_thresholds_{min_threshold:.2f}_{max_threshold:.2f}.csv"
+    )
+
+
+def build_far_frr_table(
+    labels: np.ndarray,
+    scores: np.ndarray,
+    *,
+    min_threshold: float = 0.50,
+    max_threshold: float = 0.85,
+    step: float = 0.01,
+) -> list[dict[str, Any]]:
+    """构建指定阈值范围内的固定 FAR/FRR 表格。
+
+    默认扫描 ``0.50--0.85``（步长 ``0.01``）。返回值保留接受/拒绝计数，
+    便于检查 FAR 和 FRR 的分母是否符合预期。
     """
 
-    eval_cfg = dict(config.get("evaluation", {}))
-    target_far = float(eval_cfg.get("target_far", 1.0 / 50000.0))
-    target_frr = float(eval_cfg.get("target_frr", 0.02))
+    if not 0.0 <= min_threshold <= max_threshold <= 1.0:
+        raise ValueError(
+            "FAR/FRR threshold bounds must satisfy "
+            "0 <= min_threshold <= max_threshold <= 1, "
+            f"got min={min_threshold}, max={max_threshold}."
+        )
+    if not 0.0 < step <= 1.0:
+        raise ValueError(f"FAR/FRR threshold step must be in (0,1], got {step}.")
+
+    thresholds: list[float] = []
+    value = float(min_threshold)
+    max_iterations = int(math.ceil((max_threshold - min_threshold) / step)) + 2
+    for _ in range(max(1, max_iterations)):
+        if value > max_threshold + 1e-12:
+            break
+        thresholds.append(round(value, 10))
+        value = round(value + step, 10)
+    if not thresholds or thresholds[-1] < max_threshold - 1e-12:
+        thresholds.append(round(max_threshold, 10))
+    unique_thresholds = sorted({threshold for threshold in thresholds if 0.0 <= threshold <= 1.0})
+    return [rate_at_threshold(labels, scores, threshold) for threshold in unique_thresholds]
+
+
+def select_zero_far_min_frr_threshold(
+    labels: np.ndarray,
+    scores: np.ndarray,
+) -> dict[str, Any]:
+    """选择使全体 impostor FAR=0 且 FRR 最小的精确阈值。
+
+    ``score >= threshold`` 视为接受，因此阈值必须严格大于最大 impostor
+    分数。FAR 在阈值升高时单调不增，FRR 单调不减，所以最大 impostor
+    分数之上的最小 float64 值就是 FAR=0 约束下 FRR 最小的工作点。
+    """
+
+    label_values = np.asarray(labels, dtype=np.int32).reshape(-1)
+    score_values = np.asarray(scores, dtype=np.float64).reshape(-1)
+    if label_values.size != score_values.size:
+        raise ValueError(
+            "labels and scores must have the same length: "
+            f"labels={label_values.size}, scores={score_values.size}."
+        )
+    if score_values.size and not np.all(np.isfinite(score_values)):
+        raise ValueError("Cannot select a FAR=0 threshold from non-finite scores.")
+
+    impostor_scores = score_values[label_values == 0]
+    if impostor_scores.size == 0:
+        point = rate_at_threshold(label_values, score_values, 0.0)
+        return {
+            **point,
+            "selection_status": "unavailable_no_impostor_attempts",
+            "selection_rule": "global_far_0_then_min_frr",
+            "max_impostor_score": None,
+        }
+
+    max_impostor_score = float(np.max(impostor_scores))
+    threshold = float(np.nextafter(max_impostor_score, np.inf))
+    point = rate_at_threshold(label_values, score_values, threshold)
+    if point["far"] != 0.0:
+        raise RuntimeError(
+            "Internal error: selected threshold did not produce FAR=0: "
+            f"threshold={threshold}, FAR={point['far']}."
+        )
+    return {
+        **point,
+        "selection_status": "selected",
+        "selection_rule": "global_far_0_then_min_frr",
+        "max_impostor_score": max_impostor_score,
+    }
+
+
+def build_per_finger_far_frr_table(
+    score_rows: list[dict[str, Any]],
+    operating_point: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """在同一个全局 FAR=0 工作点下汇总总体及每个注册手指的 FAR/FRR。
+
+    第一行固定为全体统计。每个手指采用 owner-centric 口径：
+    ``owner_identity`` 等于该手指的所有尝试构成分母，其中本人 query 是
+    genuine，其他手指 query 是 impostor。
+    """
+
+    threshold = float(operating_point["threshold"])
+
+    def table_row(
+        scope: str,
+        identity_id: str,
+        labels: np.ndarray,
+        scores: np.ndarray,
+    ) -> dict[str, Any]:
+        rates = rate_at_threshold(labels, scores, threshold)
+        return {
+            "scope": scope,
+            "identity_id": identity_id,
+            "threshold": rates["threshold"],
+            "far": rates["far"],
+            "frr": rates["frr"],
+            "tar": rates["tar"],
+            "genuine_accept": rates["genuine_accept"],
+            "genuine_reject": rates["genuine_reject"],
+            "genuine_total": rates["genuine_total"],
+            "impostor_accept": rates["impostor_accept"],
+            "impostor_reject": rates["impostor_reject"],
+            "impostor_total": rates["impostor_total"],
+            "selection_status": operating_point.get("selection_status", ""),
+            "selection_rule": operating_point.get("selection_rule", ""),
+            "max_impostor_score_all_fingers": operating_point.get(
+                "max_impostor_score"
+            ),
+        }
+
+    all_labels = np.asarray(
+        [int(row["label"]) for row in score_rows], dtype=np.int32
+    )
+    all_scores = np.asarray(
+        [float(row["score"]) for row in score_rows], dtype=np.float64
+    )
+    table = [table_row("all_fingers", "__ALL__", all_labels, all_scores)]
+    rows_by_owner: dict[str, list[dict[str, Any]]] = {}
+    for row in score_rows:
+        rows_by_owner.setdefault(
+            str(row.get("owner_identity", "")), []
+        ).append(row)
+    for identity_id in sorted(rows_by_owner):
+        rows = rows_by_owner[identity_id]
+        labels = np.asarray([int(row["label"]) for row in rows], dtype=np.int32)
+        scores = np.asarray([float(row["score"]) for row in rows], dtype=np.float64)
+        table.append(table_row("finger", identity_id, labels, scores))
+    return table
+
+
+def compute_metrics(
+    labels: np.ndarray,
+    scores: np.ndarray,
+    selected_threshold: float,
+) -> dict[str, Any]:
+    """汇总配置阈值下的 FAR/FRR，以及 EER 和 AUC。"""
+
     metrics: dict[str, Any] = {
         "selected_threshold": float(selected_threshold),
         "fixed_threshold": rate_at_threshold(labels, scores, selected_threshold),
         "auc": None,
         "eer": None,
         "eer_threshold": None,
-        "tar_at_far": {str(point): None for point in far_points},
-        "recommended_threshold": recommend_unlock_threshold(curve, far_points),
-        "target_operating_point": select_target_operating_threshold(curve, target_far, target_frr),
     }
     if labels.size == 0 or len(np.unique(labels)) < 2:
         return metrics
@@ -378,9 +639,6 @@ def compute_metrics(labels: np.ndarray, scores: np.ndarray, selected_threshold: 
     metrics["auc"] = float(auc(fpr, tpr))
     metrics["eer"] = float((fpr[idx] + fnr[idx]) / 2.0)
     metrics["eer_threshold"] = float(thresholds[idx])
-    for point in far_points:
-        valid = np.where(fpr <= float(point))[0]
-        metrics["tar_at_far"][str(point)] = float(np.max(tpr[valid])) if valid.size else 0.0
     return metrics
 
 
@@ -429,7 +687,6 @@ def build_effective_config_snapshot(config: dict[str, Any]) -> dict[str, Any]:
         "enrollment",
         "template_management",
         "identification",
-        "online_unlock",
         "evaluation",
         "descriptor_sources",
     ):
@@ -463,6 +720,8 @@ def build_effective_config_snapshot(config: dict[str, Any]) -> dict[str, Any]:
 
     if config.get("_config_path"):
         snapshot["source_config_path"] = str(config.get("_config_path"))
+    if config.get("_config_sources"):
+        snapshot["source_config_chain"] = list(config.get("_config_sources", []))
     return snapshot
 
 
@@ -552,7 +811,7 @@ def export_failure_cases(
     output_dir: str | Path,
     config: dict[str, Any],
 ) -> dict[str, Any]:
-    """在 target threshold 下导出失败样本。
+    """在配置的解锁阈值下导出失败样本。
 
     false_reject：
         label=1 且 score < threshold，本人被拒。
@@ -578,9 +837,14 @@ def export_failure_cases(
     max_cases = int(failure_cfg.get("max_cases_per_type", 200))
     copy_originals = bool(failure_cfg.get("copy_original_images", True))
     make_preview = bool(failure_cfg.get("make_pair_preview", True))
-    root = ensure_dir(Path(output_dir) / "failure_cases" / f"threshold_{safe_id(str(threshold))}")
+    threshold_text = format_significant_digits(threshold)
+    root = ensure_dir(
+        Path(output_dir)
+        / "failure_cases"
+        / f"threshold_{safe_id(threshold_text)}"
+    )
 
-    # 先扫描 verification_scores，找出所有目标阈值下的失败行。
+    # 先扫描 verification_scores，找出配置阈值下的失败行。
     failures: list[dict[str, Any]] = []
     for index, row in enumerate(score_rows):
         label = int(row["label"])
@@ -592,10 +856,16 @@ def export_failure_cases(
             failure_type = "false_accept"
         if not failure_type:
             continue
+        failure_stage = (
+            classify_false_reject(row, threshold, config)
+            if failure_type == "false_reject"
+            else "impostor_score_above_threshold"
+        )
         failures.append(
             {
                 "case_index": index,
                 "failure_type": failure_type,
+                "failure_stage": failure_stage,
                 "threshold": threshold,
                 "score": score,
                 "query_id": row.get("query_id", ""),
@@ -609,12 +879,33 @@ def export_failure_cases(
                 "best_image_score": row.get("best_image_score", ""),
                 "best_quality_score": row.get("best_quality_score", ""),
                 "num_raw_matches": row.get("num_raw_matches", ""),
+                "num_abs_distance_pass": row.get("num_abs_distance_pass", ""),
+                "num_one_way_ratio_pass": row.get("num_one_way_ratio_pass", ""),
+                "num_ratio_pass": row.get("num_ratio_pass", ""),
+                "num_queries_with_candidates": row.get("num_queries_with_candidates", ""),
+                "candidate_query_coverage": row.get("candidate_query_coverage", ""),
+                "templates_with_candidates": row.get("templates_with_candidates", ""),
+                "templates_with_abs_distance_pass": row.get("templates_with_abs_distance_pass", ""),
+                "templates_with_ratio_pass": row.get("templates_with_ratio_pass", ""),
+                "templates_with_ransac_success": row.get("templates_with_ransac_success", ""),
+                "ransac_success": row.get("ransac_success", ""),
+                "scale_rejected": row.get("scale_rejected", ""),
                 "num_candidates": row.get("num_candidates", ""),
                 "raw_inliers": row.get("raw_inliers", ""),
                 "unique_inliers": row.get("unique_inliers", ""),
+                "mean_descriptor_distance": row.get(
+                    "mean_descriptor_distance", ""
+                ),
                 "mean_l2_distance": row.get("mean_l2_distance", ""),
+                "mean_hamming_distance": row.get(
+                    "mean_hamming_distance", ""
+                ),
                 "mean_reproj_error": row.get("mean_reproj_error", ""),
                 "orientation_consistency": row.get("orientation_consistency", ""),
+                "geometry_similarity": row.get("geometry_similarity", ""),
+                "texture_available": row.get("texture_available", ""),
+                "texture_similarity": row.get("texture_similarity", ""),
+                "texture_decision": row.get("texture_decision", ""),
             }
         )
 
@@ -631,7 +922,13 @@ def export_failure_cases(
     for failure_type, items in ordered.items():
         type_dir = ensure_dir(root / f"{failure_type}s")
         for local_idx, item in enumerate(items[: max_cases if max_cases > 0 else None], start=1):
-            case_id = f"{failure_type}_{local_idx:05d}__score_{safe_id(str(item['score']))}__q_{safe_id(item['query_id'])}__owner_{safe_id(item['owner_identity'])}"
+            score_text = format_significant_digits(float(item["score"]))
+            case_id = (
+                f"{failure_type}_{local_idx:05d}"
+                f"__score_{safe_id(score_text)}"
+                f"__q_{safe_id(item['query_id'])}"
+                f"__owner_{safe_id(item['owner_identity'])}"
+            )
             case_dir = ensure_dir(type_dir / case_id)
             query_src = item["query_image_path"]
             template_src = item["best_template_image_path"]
@@ -646,7 +943,10 @@ def export_failure_cases(
                     template_src,
                     case_dir / "pair_preview.jpg",
                     title=f"{failure_type} | query={item['query_identity']} owner={item['owner_identity']}",
-                    score_text=f"score={item['score']} threshold={threshold} unique={item['unique_inliers']} raw={item['raw_inliers']}",
+                    score_text=(
+                        f"score={score_text} threshold={threshold_text} "
+                        f"unique={item['unique_inliers']} raw={item['raw_inliers']}"
+                    ),
                 )
             enriched = {
                 **item,
@@ -659,10 +959,15 @@ def export_failure_cases(
             exported.append(enriched)
 
     write_csv_rows(root / "failure_cases_exported.csv", exported)
+    failure_stage_counts: dict[str, int] = {}
+    for item in failures:
+        stage = str(item.get("failure_stage", "unknown"))
+        failure_stage_counts[stage] = failure_stage_counts.get(stage, 0) + 1
     summary = {
         "enabled": True,
         "threshold": threshold,
         "target_satisfied": bool(threshold_info.get("satisfied", False)),
+        "failure_stage_counts": failure_stage_counts,
         "num_false_rejects": len(ordered["false_reject"]),
         "num_false_accepts": len(ordered["false_accept"]),
         "num_exported_false_rejects": min(len(ordered["false_reject"]), max_cases) if max_cases > 0 else len(ordered["false_reject"]),
@@ -675,8 +980,15 @@ def export_failure_cases(
     return summary
 
 
-def write_plots(labels: np.ndarray, scores: np.ndarray, curve: list[dict[str, Any]], selected_threshold: float, output_dir: Path) -> None:
-    """写出分数分布图和 FAR/FRR 阈值曲线图。"""
+def write_plots(
+    labels: np.ndarray,
+    scores: np.ndarray,
+    curve: list[dict[str, Any]],
+    selected_threshold: float,
+    metrics: dict[str, Any],
+    output_dir: Path,
+) -> None:
+    """写出分数分布图，以及标注 EER 和配置阈值的 FAR/FRR 曲线图。"""
 
     plots = ensure_dir(output_dir / "plots")
     genuine = scores[labels == 1]
@@ -696,30 +1008,100 @@ def write_plots(labels: np.ndarray, scores: np.ndarray, curve: list[dict[str, An
     thresholds = [float(item["threshold"]) for item in curve]
     far = [float(item["far"] or 0.0) for item in curve]
     frr = [float(item["frr"] or 0.0) for item in curve]
+    far_color = "tab:blue"
+    frr_color = "tab:orange"
     plt.figure(figsize=(8, 5))
-    plt.plot(thresholds, far, label="FAR")
-    plt.plot(thresholds, frr, label="FRR")
-    plt.axvline(selected_threshold, color="gray", linestyle="--", linewidth=1)
+    plt.plot(thresholds, far, color=far_color, label="FAR")
+    plt.plot(thresholds, frr, color=frr_color, label="FRR")
+
+    fixed = dict(metrics.get("fixed_threshold") or {})
+    selected_far = float(fixed.get("far") or 0.0)
+    selected_frr = float(fixed.get("frr") or 0.0)
+    plt.axvline(
+        selected_threshold,
+        color="gray",
+        linestyle="--",
+        linewidth=1,
+        label="configured threshold",
+    )
+    plt.scatter(
+        [selected_threshold, selected_threshold],
+        [selected_far, selected_frr],
+        color=[far_color, frr_color],
+        s=36,
+        zorder=5,
+    )
+    plt.annotate(
+        (
+            f"Configured threshold={selected_threshold:.4f}\n"
+            f"FAR={selected_far:.4%}\n"
+            f"FRR={selected_frr:.4%}"
+        ),
+        xy=(selected_threshold, max(selected_far, selected_frr)),
+        xytext=(-8, 28),
+        textcoords="offset points",
+        ha="right",
+        va="bottom",
+        fontsize=8,
+        arrowprops={"arrowstyle": "->", "color": "gray", "linewidth": 0.8},
+    )
+
+    eer = metrics.get("eer")
+    eer_threshold = metrics.get("eer_threshold")
+    if eer is not None and eer_threshold is not None:
+        eer_value = float(eer)
+        eer_x = float(eer_threshold)
+        plt.axvline(
+            eer_x,
+            color="tab:green",
+            linestyle=":",
+            linewidth=1,
+            label="EER threshold",
+        )
+        plt.scatter(
+            [eer_x],
+            [eer_value],
+            color="tab:green",
+            marker="o",
+            s=42,
+            zorder=5,
+        )
+        plt.annotate(
+            f"EER threshold={eer_x:.4f}\nEER={eer_value:.4%}",
+            xy=(eer_x, eer_value),
+            xytext=(8, -38),
+            textcoords="offset points",
+            ha="left",
+            va="top",
+            fontsize=8,
+            arrowprops={
+                "arrowstyle": "->",
+                "color": "tab:green",
+                "linewidth": 0.8,
+            },
+        )
+
     plt.legend()
     plt.xlabel("match score threshold")
+    plt.ylabel("error rate")
+    plt.grid(alpha=0.2)
     plt.tight_layout()
     plt.savefig(plots / "far_frr_vs_threshold.png", dpi=150)
     plt.close()
 
 
 def write_unlock_timing_report(score_rows: list[dict[str, str]], output_dir: str | Path) -> dict[str, Any]:
-    """从本人验证记录中生成手机解锁耗时明细和汇总报告。
+    """从本人评估记录中生成总体耗时汇总。
 
-    离线评估中的本人尝试可用于估算查询模板构建和完整模板匹配耗时，但该流程
-    不启用在线早停，因此它不是最终在线延迟数据；准确的早停延迟应由
-    ``run_online_unlock.py --benchmark`` 测量。
+    离线评估不生成逐次解锁 CSV；推理阶段耗时已记录在模板构建计时中。
     """
 
-    rows: list[dict[str, Any]] = []
     total_genuine_attempts = 0
     failed_genuine_attempts = 0
+    successful_unlocks_timed = 0
     match_values: list[float] = []
     end_to_end_values: list[float] = []
+    end_to_end_core_values: list[float] = []
     for row in score_rows:
         if int(row.get("label", 0)) != 1:
             continue
@@ -727,90 +1109,70 @@ def write_unlock_timing_report(score_rows: list[dict[str, str]], output_dir: str
         if int(row.get("accepted_at_selected_threshold", 0)) != 1:
             failed_genuine_attempts += 1
             continue
+        successful_unlocks_timed += 1
         match_ms = parse_float(row.get("unlock_match_ms"))
         end_to_end_ms = parse_float(row.get("unlock_end_to_end_ms"))
-        query_build_ms = parse_float(row.get("query_template_build_ms"))
+        end_to_end_core_ms = parse_float(row.get("unlock_end_to_end_core_ms"))
         if match_ms is not None:
             match_values.append(match_ms)
+        if end_to_end_core_ms is not None:
+            end_to_end_core_values.append(end_to_end_core_ms)
+        elif end_to_end_ms is not None:
+            end_to_end_core_values.append(
+                compute_end_to_end_core_ms(end_to_end_ms, row)
+            )
         if end_to_end_ms is not None:
             end_to_end_values.append(end_to_end_ms)
-        rows.append(
-            {
-                "query_id": row.get("query_id", ""),
-                "query_identity": row.get("query_identity", ""),
-                "owner_identity": row.get("owner_identity", ""),
-                "score": row.get("score", ""),
-                "accepted_at_selected_threshold": row.get("accepted_at_selected_threshold", ""),
-                "accepted_at_target_threshold": row.get("accepted_at_target_threshold", ""),
-                "query_template_build_ms": "" if query_build_ms is None else query_build_ms,
-                "unlock_match_ms": "" if match_ms is None else match_ms,
-                "unlock_end_to_end_ms": "" if end_to_end_ms is None else end_to_end_ms,
-                "best_template_image_id": row.get("best_template_image_id", ""),
-                "num_templates": row.get("num_templates", ""),
-                "num_templates_evaluated": row.get("num_templates_evaluated", ""),
-                "early_stopped": row.get("early_stopped", ""),
-                "early_stop_threshold": row.get("early_stop_threshold", ""),
-                "unique_inliers": row.get("unique_inliers", ""),
-                "num_candidates": row.get("num_candidates", ""),
-                "texture_similarity": row.get("texture_similarity", ""),
-                "texture_overlap_fraction": row.get("texture_overlap_fraction", ""),
-                "texture_valid_blocks": row.get("texture_valid_blocks", ""),
-                "geometry_similarity": row.get("geometry_similarity", ""),
-                "geometry_weight": row.get("geometry_weight", ""),
-                "texture_weight": row.get("texture_weight", ""),
-                "texture_decision": row.get("texture_decision", ""),
-                "registered_template_load_ms": row.get("registered_template_load_ms", ""),
-                "descriptor_prepare_ms": row.get("descriptor_prepare_ms", ""),
-                "candidate_generation_ms": row.get("candidate_generation_ms", ""),
-                "candidate_filter_ms": row.get("candidate_filter_ms", ""),
-                "ransac_ms": row.get("ransac_ms", ""),
-                "inlier_refinement_ms": row.get("inlier_refinement_ms", ""),
-                "texture_similarity_ms": row.get("texture_similarity_ms", ""),
-                "score_fusion_ms": row.get("score_fusion_ms", ""),
-                "postprocess_ms": row.get("postprocess_ms", ""),
-                "image_match_total_ms": row.get("image_match_total_ms", ""),
-                "identity_fusion_ms": row.get("identity_fusion_ms", ""),
-                "identity_match_overhead_ms": row.get("identity_match_overhead_ms", ""),
-                "identity_match_total_ms": row.get("identity_match_total_ms", ""),
-            }
-        )
     out = ensure_dir(output_dir)
-    write_csv_rows(Path(out) / "unlock_timing.csv", rows)
+    (Path(out) / "unlock_timing.csv").unlink(missing_ok=True)
     summary = {
         "definition": {
             "timing_scope": "只统计在 selected threshold 下成功接受的本人解锁记录。",
             "unlock_match_ms": "查询模板已存在时，与一个手指的注册模板集合完成匹配的时间。",
             "unlock_end_to_end_ms": "query_template_build_ms + unlock_match_ms；不包含模型/SIFT初始化和传感器采集。",
+            "unlock_end_to_end_core_ms": (
+                "unlock_end_to_end_ms 扣除 descriptor_prepare_ms、postprocess_ms、"
+                "identity_match_overhead_ms、matching_wrapper_overhead_ms。"
+            ),
+            "end_to_end_summary": (
+                "end_to_end 汇总使用 unlock_end_to_end_core_ms；"
+                "end_to_end_wall_clock 为完整 unlock_end_to_end_ms。"
+            ),
         },
         "total_genuine_attempts": total_genuine_attempts,
-        "successful_unlocks_timed": len(rows),
+        "successful_unlocks_timed": successful_unlocks_timed,
         "failed_unlocks_excluded": failed_genuine_attempts,
         "match_only": summarize_timing(match_values),
-        "end_to_end": summarize_timing(end_to_end_values),
+        "end_to_end": summarize_timing(end_to_end_core_values),
+        "end_to_end_wall_clock": summarize_timing(end_to_end_values),
     }
     write_json(Path(out) / "unlock_timing.json", summary)
     return summary
 
 
 def run_descriptor_l2_evaluation(
-    metadata_path: str | Path,
+    metadata_rows: list[dict[str, str]],
     identity_templates_path: str | Path,
     template_dir: str | Path,
     config: dict[str, Any],
     output_dir: str | Path,
     descriptor_source: str = "hardnet",
-    max_impostor_identities_per_query: int = 0,
+    max_impostor_identities_per_query: int = -1,
     export_failures: bool = True,
 ) -> dict[str, Any]:
-    """执行完整 identity 级 L2 descriptor 验证评估。
+    """执行完整 identity 级 descriptor 验证评估。
 
+    距离算法由 matching.distance 与模板契约共同约束，可为 L2 或 Hamming。
     输入是已经固定好的 split metadata、identity_templates_20.json 和 image_templates。
     本函数不再重新构建模板，只负责：
         1. 遍历 query；
         2. 生成 genuine/impostor attempts；
         3. 写 verification_scores.csv；
         4. 计算阈值曲线和指标；
-        5. 导出目标阈值下失败样本。
+        5. 导出配置阈值下的失败样本。
+
+    ``max_impostor_identities_per_query``：
+        ``-1`` 全量非本人；``0`` 不比对非本人；``>0`` 每个 query 最多抽这么多个非本人身份。
     """
 
     out = ensure_dir(output_dir)
@@ -820,43 +1182,118 @@ def run_descriptor_l2_evaluation(
     if source not in {"hardnet", "sift"}:
         raise ValueError(f"unsupported descriptor_source: {descriptor_source}")
     identities = load_identity_templates(identity_templates_path)
-    rows = read_csv_rows(metadata_path)
-    query_rows = select_query_rows(rows)
+    query_rows = select_query_rows(metadata_rows)
+    if not query_rows:
+        raise ValueError("No query rows found in metadata.")
     identification_cfg = dict(config.get("identification", {}))
-    evaluation_cfg = dict(config.get("evaluation", {}))
-    selected_threshold = float(identification_cfg.get("match_score_threshold", 0.55))
-    if not 0.0 <= selected_threshold <= 1.0:
+    configured_threshold = float(identification_cfg.get("match_score_threshold", 0.55))
+    if not 0.0 <= configured_threshold <= 1.0:
         raise ValueError(
-            f"identification.match_score_threshold must be in [0,1], got {selected_threshold}"
+            f"identification.match_score_threshold must be in [0,1], got {configured_threshold}"
         )
     fusion_method = str(identification_cfg.get("fusion_method", "max"))
-    # 离线标定必须遍历全部注册模板并保留真实 identity 最大分数，否则阈值曲线、
-    # FAR 和 FRR 会受模板顺序影响。固定阈值早停仅由独立的在线解锁引擎处理。
+    management_cfg = dict(config.get("template_management", {}))
     scoring_config = copy.deepcopy(config)
-    scoring_config.setdefault("identification", {})["early_stop_on_unlock_threshold"] = False
-    far_points = [float(point) for point in evaluation_cfg.get("far_points", [0.001, 0.0001])]
+    if bool(management_cfg.get("enabled", False)):
+        # 模板库会按 LRU 改变顺序；学习模式必须完整遍历，避免早停导致
+        # 同一 query 因模板顺序变化而得到不同的 identity 分数。
+        scoring_identification = dict(scoring_config.get("identification", {}))
+        scoring_identification["early_stop_on_unlock_threshold"] = False
+        scoring_identification["early_stop_threshold"] = None
+        scoring_config["identification"] = scoring_identification
+    early_stop_threshold = resolve_early_stop_threshold(scoring_config)
+    early_stop_enabled = early_stop_threshold is not None
     rng = np.random.default_rng(int(dict(config.get("enrollment", {})).get("random_seed", 42)))
-    max_impostors = max(0, int(max_impostor_identities_per_query))
+    max_impostors = int(max_impostor_identities_per_query)
+    if max_impostors < -1:
+        raise ValueError(
+            "runtime.max_impostor_identities_per_query 须为 -1（全量）、"
+            f"0（不比对非本人）或正整数，收到: {max_impostors}"
+        )
     cache: dict[str, dict[str, Any]] = {}
     scores_path = out / "verification_scores.csv"
     management_cfg = dict(config.get("template_management", {}))
+    template_manager: TemplateLibraryManager | None = None
+    learning_events: list[dict[str, Any]] = []
+    if bool(management_cfg.get("enabled", False)):
+        # identity_templates_path 在本次运行前刚由 build_identity_templates 重建，
+        # 因此每次重跑都会从初始 seed 模板重新开始。
+        template_manager = TemplateLibraryManager(
+            identities,
+            identity_templates_path,
+            management_cfg,
+            initial_template_count=int(
+                dict(config.get("enrollment", {})).get(
+                    "enrollment_images_per_identity",
+                    20,
+                )
+            ),
+        )
 
-    # 第一遍：逐 query 逐 identity 打分，并把每次验证尝试写入 CSV。
-    with scores_path.open("w", encoding="utf-8", newline="") as handle:
+    # 第一遍：每个 query 先完整处理本人匹配和模板学习，再处理非本人匹配。
+    score_rows: list[dict[str, str]] = []
+    with scores_path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=SCORE_FIELDNAMES)
         writer.writeheader()
-        for row in tqdm(query_rows, desc=f"evaluate {source}_l2"):
+        for row in tqdm(
+            query_rows,
+            desc=f"evaluate {source}_{dict(config.get('matching', {})).get('distance', 'auto')}",
+        ):
             query_template_path = Path(template_dir) / template_filename(row["identity_id"], row["image_id"])
             query_template = load_template_cached(query_template_path, cache, require=source)
             true_identity = row["identity_id"]
-            genuine = [item for item in identities if item["identity_id"] == true_identity]
-            impostors = [item for item in identities if item["identity_id"] != true_identity]
-            if max_impostors > 0 and len(impostors) > max_impostors:
+            genuine_identity = next(
+                (item for item in identities if str(item["identity_id"]) == true_identity),
+                None,
+            )
+            if genuine_identity is None:
+                raise RuntimeError(f"No registered identity found for query: {true_identity}")
+
+            for path in genuine_identity.get("template_paths", []):
+                load_template_cached(path, cache, require=source)
+            started = time.perf_counter()
+            genuine_result = score_query_against_identity(
+                query_template,
+                genuine_identity,
+                scoring_config,
+                cache,
+                descriptor_source=source,
+                early_stop_threshold=early_stop_threshold,
+            )
+            genuine_attempt_ms = (time.perf_counter() - started) * 1000.0
+
+            if template_manager is not None:
+                learning_events.append(
+                    template_manager.learn_after_match(
+                        query_template,
+                        genuine_identity,
+                        scoring_config,
+                        genuine_result,
+                        template_loader=lambda path: load_template_cached(
+                            path,
+                            cache,
+                            require=source,
+                        ),
+                        descriptor_source=source,
+                    )
+                )
+
+            # 学习完成后再读取 impostor 列表；新模板只影响当前 query 后续的匹配，
+            # 不回写或重算已经完成的 genuine 结果。
+            impostors = [
+                item for item in identities
+                if str(item["identity_id"]) != true_identity
+            ]
+            if max_impostors == 0:
+                impostors = []
+            elif max_impostors > 0 and len(impostors) > max_impostors:
                 chosen = rng.choice(len(impostors), size=max_impostors, replace=False)
                 impostors = [impostors[int(i)] for i in chosen]
-            # 每个 query 一定包含 1 个 genuine owner，外加若干 impostor owners。
-            for identity in genuine + impostors:
-                owner = str(identity["identity_id"])
+
+            attempts: list[tuple[dict[str, Any], dict[str, Any], bool, float]] = [
+                (genuine_identity, genuine_result, True, genuine_attempt_ms),
+            ]
+            for identity in impostors:
                 for path in identity.get("template_paths", []):
                     load_template_cached(path, cache, require=source)
                 started = time.perf_counter()
@@ -866,97 +1303,200 @@ def run_descriptor_l2_evaluation(
                     scoring_config,
                     cache,
                     descriptor_source=source,
-                    early_stop_threshold=None,
+                    early_stop_threshold=early_stop_threshold,
                 )
-                attempt_ms = (time.perf_counter() - started) * 1000.0
+                attempts.append(
+                    (
+                        identity,
+                        result,
+                        False,
+                        (time.perf_counter() - started) * 1000.0,
+                    )
+                )
+
+            for identity, result, is_genuine, attempt_ms in attempts:
+                owner = str(identity["identity_id"])
                 score = float(result["score"])
-                is_genuine = owner == true_identity
                 query_build_ms = parse_float(row.get("template_build_ms"))
-                unlock_end_to_end_ms = query_build_ms + attempt_ms if is_genuine and query_build_ms is not None else None
-                writer.writerow(
+                unlock_end_to_end_ms = (
+                    query_build_ms + attempt_ms
+                    if is_genuine and query_build_ms is not None
+                    else None
+                )
+                unlock_end_to_end_core_ms = (
+                    compute_end_to_end_core_ms(unlock_end_to_end_ms, result)
+                    if unlock_end_to_end_ms is not None
+                    else None
+                )
+                csv_row = {
+                    "query_id": row["image_id"],
+                    "query_identity": true_identity,
+                    "owner_identity": owner,
+                    "label": int(is_genuine),
+                    "score": score,
+                    "accepted_at_selected_threshold": int(score >= configured_threshold),
+                    "query_image_path": str(query_template.get("image_path", row.get("image_path", ""))),
+                    "query_template_path": str(query_template_path),
+                    **{
+                        key: value
+                        for key, value in result.items()
+                        if key in SCORE_FIELDNAMES
+                    },
+                    "attempt_match_ms": f"{attempt_ms:.3f}",
+                    "query_template_build_ms": "" if query_build_ms is None else f"{query_build_ms:.3f}",
+                    "unlock_match_ms": f"{attempt_ms:.3f}" if is_genuine else "",
+                    "unlock_end_to_end_ms": "" if unlock_end_to_end_ms is None else f"{unlock_end_to_end_ms:.3f}",
+                    "unlock_end_to_end_core_ms": (
+                        ""
+                        if unlock_end_to_end_core_ms is None
+                        else f"{unlock_end_to_end_core_ms:.3f}"
+                    ),
+                }
+                writer.writerow(csv_row)
+                score_rows.append(
                     {
-                        "query_id": row["image_id"],
-                        "query_identity": true_identity,
-                        "owner_identity": owner,
-                        "label": int(is_genuine),
-                        "score": score,
-                        "accepted_at_selected_threshold": int(score >= selected_threshold),
-                        "query_image_path": str(query_template.get("image_path", row.get("image_path", ""))),
-                        "query_template_path": str(query_template_path),
-                        **result,
-                        "attempt_match_ms": f"{attempt_ms:.3f}",
-                        "query_template_build_ms": "" if query_build_ms is None else f"{query_build_ms:.3f}",
-                        "unlock_match_ms": f"{attempt_ms:.3f}" if is_genuine else "",
-                        "unlock_end_to_end_ms": "" if unlock_end_to_end_ms is None else f"{unlock_end_to_end_ms:.3f}",
+                        field: "" if csv_row.get(field) is None else str(csv_row.get(field, ""))
+                        for field in SCORE_FIELDNAMES
                     }
                 )
 
-    # 第二遍：读取分数 CSV，统一计算指标和目标阈值。
-    score_rows = read_csv_rows(scores_path)
+    # 第二遍：使用全部 query 的 identity 级分数生成阈值曲线和统一指标。
     labels = np.asarray([int(row["label"]) for row in score_rows], dtype=np.int32)
     scores = np.asarray([float(row["score"]) for row in score_rows], dtype=np.float32)
     curve = build_threshold_curve(labels, scores, config)
-    metrics = compute_metrics(labels, scores, selected_threshold, far_points, curve, config)
-    target = metrics.get("target_operating_point") or {}
-    target_threshold = float(target.get("threshold", selected_threshold))
-    # 额外写一份带 target threshold 判定结果的 CSV，方便后续人工筛选。
+    metrics = compute_metrics(
+        labels,
+        scores,
+        configured_threshold,
+    )
+    # FAR=0 工作点使用 CSV 中的原始 float64 分数，避免 float32 舍入把
+    # 最大 impostor 分数压低后产生一个实际仍会误接受的阈值。
+    zero_far_scores = np.asarray(
+        [float(row["score"]) for row in score_rows], dtype=np.float64
+    )
+    zero_far_operating_point = select_zero_far_min_frr_threshold(
+        labels, zero_far_scores
+    )
+    metrics["zero_far_min_frr_operating_point"] = zero_far_operating_point
+    selected_threshold = configured_threshold
+    metrics["configured_threshold"] = configured_threshold
+    metrics["selected_threshold"] = selected_threshold
+    metrics["fixed_threshold"] = rate_at_threshold(labels, scores, selected_threshold)
+
     for row in score_rows:
         score = float(row["score"])
-        row["accepted_at_target_threshold"] = int(score >= target_threshold)
-        row["target_failure_type"] = "false_reject" if int(row["label"]) == 1 and score < target_threshold else ("false_accept" if int(row["label"]) == 0 and score >= target_threshold else "")
-    write_csv_rows(out / "verification_scores_target_threshold.csv", score_rows)
+        row["accepted_at_selected_threshold"] = int(score >= selected_threshold)
+    write_csv_rows(out / "verification_scores.csv", score_rows)
     unlock_timing = write_unlock_timing_report(score_rows, out)
-    failure_summary = export_failure_cases(score_rows, metrics.get("target_operating_point"), out, config) if export_failures else {"enabled": False, "reason": "export_failures_false"}
+    failure_summary = (
+        export_failure_cases(
+            score_rows,
+            {"threshold": selected_threshold},
+            out,
+            config,
+        )
+        if export_failures
+        else {"enabled": False, "reason": "export_failures_false"}
+    )
     effective_config = build_effective_config_snapshot(scoring_config)
-    template_management_summary = {
-        "enabled": False,
-        "requested_in_config": bool(management_cfg.get("enabled", False)),
-        "reason": "offline_calibration_never_updates_templates",
-    }
+    template_management_summary = (
+        template_manager.summarize_events(learning_events)
+        if template_manager is not None
+        else {
+            "enabled": False,
+            "requested_in_config": bool(management_cfg.get("enabled", False)),
+            "reason": "template_management_disabled",
+        }
+    )
+    num_queries = len(
+        {
+            (str(row.get("query_identity", "")), str(row.get("query_id", "")))
+            for row in score_rows
+        }
+    )
     metrics.update(
         {
             "descriptor_source": source,
             "matching_backend": matching_backend_name(source, scoring_config),
-            "num_queries": len(query_rows),
+            "num_queries": num_queries,
             "num_identities": len(identities),
             "num_match_attempts": len(score_rows),
             "num_genuine_attempts": int(np.sum(labels == 1)),
             "num_impostor_attempts": int(np.sum(labels == 0)),
             "fusion_method": fusion_method,
-            "scoring_mode": "offline_full_threshold_calibration",
-            "offline_full_template_scoring": True,
-            "early_stop_on_unlock_threshold": False,
-            "early_stop_threshold": None,
+            "scoring_mode": (
+                "early_stop_query_pool_evaluation"
+                if early_stop_enabled
+                else "full_query_pool_evaluation"
+            ),
+            "offline_full_template_scoring": not early_stop_enabled,
+            "early_stop_on_unlock_threshold": early_stop_enabled,
+            "early_stop_threshold": early_stop_threshold,
             "max_impostor_identities_per_query": max_impostors,
             "matching_config": dict(scoring_config.get("matching", {})),
             "texture_verification_config": dict(scoring_config.get("texture_verification", {})),
             "template_management": template_management_summary,
-            "score_component_summary": summarize_score_components(score_rows, selected_threshold),
+            "score_component_summary": summarize_score_components(
+                score_rows,
+                selected_threshold,
+            ),
+            "matching_stage_summary": summarize_matching_stages(
+                score_rows,
+                scoring_config,
+            ),
             "effective_config": effective_config,
             "unlock_timing": unlock_timing,
             "failure_export": failure_summary,
         }
     )
     write_csv_rows(out / "match_score_threshold_curve.csv", curve)
+    far_frr_table_cfg = resolve_far_frr_table_config(config)
+    far_frr_table_path = out / far_frr_table_filename(
+        far_frr_table_cfg["min_threshold"],
+        far_frr_table_cfg["max_threshold"],
+    )
+    far_frr_table_rows = build_far_frr_table(
+        labels,
+        scores,
+        min_threshold=far_frr_table_cfg["min_threshold"],
+        max_threshold=far_frr_table_cfg["max_threshold"],
+        step=far_frr_table_cfg["step"],
+    )
+    write_csv_rows(far_frr_table_path, far_frr_table_rows)
+    metrics["far_frr_table"] = {
+        **far_frr_table_cfg,
+        "path": str(far_frr_table_path),
+        "num_rows": len(far_frr_table_rows),
+    }
+    per_finger_far_frr_path = out / "per_finger_far_frr_at_global_zero_far.csv"
+    write_csv_rows(
+        per_finger_far_frr_path,
+        build_per_finger_far_frr_table(score_rows, zero_far_operating_point),
+    )
     write_json(out / "metrics.json", metrics)
     write_yaml(out / "effective_config.yaml", effective_config)
-    write_plots(labels, scores, curve, selected_threshold, out)
-    return {"metrics": metrics, "scores_path": str(scores_path)}
+    write_plots(labels, scores, curve, selected_threshold, metrics, out)
+    return {
+        "metrics": metrics,
+        "scores_path": str(scores_path),
+        "far_frr_table_path": str(far_frr_table_path),
+        "per_finger_far_frr_path": str(per_finger_far_frr_path),
+    }
 
 
 def run_hardnet_evaluation(
-    metadata_path: str | Path,
+    metadata_rows: list[dict[str, str]],
     identity_templates_path: str | Path,
     template_dir: str | Path,
     config: dict[str, Any],
     output_dir: str | Path,
-    max_impostor_identities_per_query: int = 0,
+    max_impostor_identities_per_query: int = -1,
     export_failures: bool = True,
 ) -> dict[str, Any]:
-    """兼容旧入口：只评估 HardNet L2。"""
+    """兼容旧入口：按 HardNet 模板契约评估 L2 或 Hamming。"""
 
     return run_descriptor_l2_evaluation(
-        metadata_path=metadata_path,
+        metadata_rows=metadata_rows,
         identity_templates_path=identity_templates_path,
         template_dir=template_dir,
         config=config,
@@ -965,59 +1505,3 @@ def run_hardnet_evaluation(
         max_impostor_identities_per_query=max_impostor_identities_per_query,
         export_failures=export_failures,
     )
-
-
-def summary_row(metrics: dict[str, Any], far_points: list[float]) -> dict[str, Any]:
-    """把 metrics.json 压平成一行 summary CSV。"""
-
-    fixed = metrics.get("fixed_threshold") or {}
-    rec = metrics.get("recommended_threshold") or {}
-    target = metrics.get("target_operating_point") or {}
-    failure_export = metrics.get("failure_export") or {}
-    texture_config = metrics.get("texture_verification_config") or {}
-    row: dict[str, Any] = {
-        "descriptor_source": metrics.get("descriptor_source", "hardnet"),
-        "matching_backend": metrics.get("matching_backend", "hardnet_l2_unknown_ransac"),
-        "num_queries": metrics.get("num_queries", ""),
-        "num_identities": metrics.get("num_identities", ""),
-        "num_match_attempts": metrics.get("num_match_attempts", ""),
-        "num_genuine_attempts": metrics.get("num_genuine_attempts", ""),
-        "num_impostor_attempts": metrics.get("num_impostor_attempts", ""),
-        "scoring_mode": metrics.get("scoring_mode", ""),
-        "offline_full_template_scoring": metrics.get("offline_full_template_scoring", ""),
-        "early_stop_on_unlock_threshold": metrics.get("early_stop_on_unlock_threshold", ""),
-        "early_stop_threshold": metrics.get("early_stop_threshold", ""),
-        "texture_verification_enabled": texture_config.get("enabled", ""),
-        "geometry_weight": texture_config.get("geometry_weight", ""),
-        "texture_weight": texture_config.get("texture_weight", ""),
-        "geometry_saturation_inliers": texture_config.get("geometry_saturation_inliers", ""),
-        "selected_threshold": metrics.get("selected_threshold", ""),
-        "eer": metrics.get("eer", ""),
-        "eer_threshold": metrics.get("eer_threshold", ""),
-        "auc": metrics.get("auc", ""),
-        "far_at_selected_threshold": fixed.get("far", ""),
-        "frr_at_selected_threshold": fixed.get("frr", ""),
-        "tar_at_selected_threshold": fixed.get("tar", ""),
-        "recommended_threshold": rec.get("threshold", ""),
-        "recommended_far": rec.get("far", ""),
-        "recommended_frr": rec.get("frr", ""),
-        "recommended_tar": rec.get("tar", ""),
-        "recommended_reason": rec.get("reason", ""),
-        "target_threshold": target.get("threshold", ""),
-        "target_far": target.get("far", ""),
-        "target_frr": target.get("frr", ""),
-        "target_tar": target.get("tar", ""),
-        "target_satisfied": target.get("satisfied", ""),
-        "target_reason": target.get("reason", ""),
-        "target_far_requirement": target.get("target_far", ""),
-        "target_frr_requirement": target.get("target_frr", ""),
-        "num_false_rejects_at_target": failure_export.get("num_false_rejects", ""),
-        "num_false_accepts_at_target": failure_export.get("num_false_accepts", ""),
-        "failure_dir": failure_export.get("failure_dir", ""),
-    }
-    tar_at_far = metrics.get("tar_at_far") or {}
-    for point in far_points:
-        tar = tar_at_far.get(str(point), "")
-        row[f"tar_at_far_{point}"] = tar
-        row[f"frr_at_far_{point}"] = "" if tar in {"", None} else 1.0 - float(tar)
-    return row

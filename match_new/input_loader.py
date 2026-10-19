@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -49,46 +50,82 @@ def _duplicate_safe_image_ids(
     return image_ids
 
 
+def _iter_files_in_directory_order(directory: Path) -> Iterable[Path]:
+    """按文件系统枚举顺序深度优先遍历文件，不按路径字符串排序。"""
+
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            path = Path(entry.path)
+            if entry.is_file(follow_symlinks=False):
+                yield path
+            elif entry.is_dir(follow_symlinks=False):
+                yield from _iter_files_in_directory_order(path)
+
+
 def scan_image_metadata(
     image_root: str | Path,
-    identity_depth: int,
     image_extensions: Iterable[str] | None = None,
     validate_readable: bool = True,
 ) -> list[dict[str, str]]:
-    """Scan raw images and derive identity IDs from leading directories."""
+    """扫描原始图像；固定要求 ``image_root/<手指目录>/图像文件``。
+
+    合法示例（类似 ``datasets/wet``）::
+
+        image_root/
+          dy_L0/pair_1.bmp
+          dy_L1/pair_2.bmp
+
+    非法示例（多一层中间目录）::
+
+        image_root/
+          datasets/A/xxx.bmp
+          datasets/B/xxx.bmp
+    """
 
     root = Path(image_root).expanduser().resolve()
     if not root.exists():
         raise FileNotFoundError(f"Raw image directory does not exist: {root}")
     if not root.is_dir():
         raise NotADirectoryError(f"Raw image path is not a directory: {root}")
-    if int(identity_depth) <= 0:
-        raise ValueError(f"data.identity_depth must be greater than 0, got {identity_depth}.")
 
     allowed = _normalize_extensions(image_extensions)
     items: list[tuple[Path, Path, str]] = []
     shallow_paths: list[Path] = []
+    deep_paths: list[Path] = []
     bad_paths: list[Path] = []
 
-    for path in sorted(root.rglob("*")):
+    for path in _iter_files_in_directory_order(root):
         if not path.is_file() or path.suffix.lower() not in allowed:
             continue
         relative = path.relative_to(root)
         directory_parts = relative.parts[:-1]
-        if len(directory_parts) < int(identity_depth):
+        if len(directory_parts) < 1:
             shallow_paths.append(relative)
+            continue
+        if len(directory_parts) > 1:
+            deep_paths.append(relative)
             continue
         if validate_readable and not _is_readable_image(path):
             bad_paths.append(relative)
             continue
-        identity_id = "/".join(directory_parts[: int(identity_depth)])
+        identity_id = directory_parts[0]
         items.append((path.resolve(), relative, identity_id))
 
     if shallow_paths:
         examples = ", ".join(path.as_posix() for path in shallow_paths[:5])
         raise ValueError(
-            f"{len(shallow_paths)} image(s) do not have {identity_depth} identity directory level(s) "
-            f"under {root}. Examples: {examples}"
+            f"{len(shallow_paths)} 张图直接放在 `{root}` 下，缺少手指目录。"
+            f"期望结构为 `图像根/<手指目录>/文件名`（类似 datasets/wet）。"
+            f"示例: {examples}"
+        )
+    if deep_paths:
+        examples = ", ".join(path.as_posix() for path in deep_paths[:5])
+        raise ValueError(
+            f"{len(deep_paths)} 张图相对 `{root}` 多了一层或多层中间目录，当前只允许"
+            f" `图像根/<手指目录>/文件名`。"
+            f"请把 data.image_root 指到直接包含各手指文件夹的目录"
+            f"（类似 `datasets/wet`），不要指到更上层。"
+            f"示例: {examples}"
         )
     if bad_paths:
         examples = ", ".join(path.as_posix() for path in bad_paths[:5])
@@ -120,9 +157,13 @@ def load_raw_image_metadata(config: dict[str, Any]) -> list[dict[str, str]]:
     image_root = data_cfg.get("image_root")
     if not image_root:
         raise ValueError("data.image_root is required.")
+    if "identity_depth" in data_cfg:
+        raise ValueError(
+            "data.identity_depth 已移除：数据集必须固定为 "
+            "`image_root/<手指目录>/图像文件`，请从配置中删除该字段。"
+        )
     return scan_image_metadata(
         resolve_path(config, image_root),
-        identity_depth=int(data_cfg.get("identity_depth", 1)),
         image_extensions=data_cfg.get("image_extensions", DEFAULT_IMAGE_EXTENSIONS),
         validate_readable=bool(data_cfg.get("validate_readable", True)),
     )
@@ -133,18 +174,39 @@ def validate_identity_image_counts(
     minimum: int,
     *,
     context: str,
-) -> None:
-    """Require enough images per identity for enrollment and at least one query."""
+) -> list[dict[str, str]]:
+    """保留图像数足够的身份；不足的跳过并打印提示，而不是直接终止。
+
+    每个身份至少需要 ``minimum`` 张图（通常为注册数 + 1 张查询）。
+    若全部身份都被跳过，则仍报错。
+    """
 
     groups: dict[str, int] = defaultdict(int)
     for row in rows:
         groups[str(row["identity_id"])] += 1
-    insufficient = [(identity_id, count) for identity_id, count in sorted(groups.items()) if count < int(minimum)]
-    if not insufficient:
-        return
-    examples = ", ".join(f"{identity_id}={count}" for identity_id, count in insufficient[:10])
-    raise ValueError(
-        f"{len(insufficient)} identity/identities have fewer than {minimum} images in {context}. "
-        f"At least {minimum - 1} enrollment image(s) and one query image are required. "
-        f"Examples: {examples}"
-    )
+    min_count = int(minimum)
+    insufficient = {
+        identity_id
+        for identity_id, count in groups.items()
+        if count < min_count
+    }
+    for identity_id in sorted(insufficient):
+        count = groups[identity_id]
+        print(
+            f"[跳过] 身份目录 `{identity_id}` 仅有 {count} 张图"
+            f"（{context}），少于所需的 {min_count} 张"
+            f"（注册 {min_count - 1} + 查询 1），已跳过该目录。"
+        )
+    kept = [row for row in rows if str(row["identity_id"]) not in insufficient]
+    if not kept:
+        raise ValueError(
+            f"全部 {len(insufficient)} 个身份在 {context} 中图像数都少于 "
+            f"{min_count}，无法继续。每个身份至少需要 "
+            f"{min_count - 1} 张注册图和 1 张查询图。"
+        )
+    if insufficient:
+        print(
+            f"[提示] 已跳过 {len(insufficient)} 个图像数不足的身份目录，"
+            f"剩余 {len(groups) - len(insufficient)} 个身份继续处理。"
+        )
+    return kept

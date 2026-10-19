@@ -1,20 +1,35 @@
-# HardNet 高 dropout / 较大学习率训练配置。
-# 训练命令python -m hardnet_train.train --config hardnet_train/config.yaml
-# 论文原文 3.2 节提到：在 PyTorch 版本更新后，作者重新搜索超参，
-# 发现把学习率提高到 10、dropout 提高到 0.3 能恢复/提升结果。
-# 当前项目中改用 warmup + cosine decay，避免线性衰减在模型仍改善时直接降到 0。
+# HardNet Strong V2 高精度浮点描述子默认训练配置。
+# 训练命令：python -m hardnet_train.train --config hardnet_train/config.yaml
+# descriptor_dim=auto 会按架构选择默认维度：Strong V2 为 256，
+# MobileHardNet 和原版 HardNet 为 128。
 
 seed: 42
-output_dir: ../outputs/hardnet_train_fingers_hard3
+# output_dir=auto 会按 architecture 使用独立目录，避免不同网络 checkpoint 混放。
+output_dir: auto
 
 data:
-  train_csv: ../outputs/hardnet_dataset/train_pairs.csv
-  val_csv: ../outputs/hardnet_dataset/val_pairs.csv
-  test_csv: ../outputs/hardnet_dataset/test_pairs.csv
+  train_csv: ../outputs/butieping/train_pairs.csv
+  val_csv: ../outputs/butieping/val_pairs.csv
   normalize: true
+  # 只对训练 patch 在线增强；anchor/positive 独立采样，验证集始终保持原图。
+  # patch 已按关键点方向对齐，因此几何扰动保持轻微，不使用翻转或大角度旋转。
+  train_augmentation:
+    enabled: true
+    # 30% patch 保持原样，70% 执行下列随机扰动。
+    probability: 0.70
+    max_rotation_degrees: 5.0
+    max_translation_pixels: 1.0
+    scale_jitter: 0.03
+    contrast_jitter: 0.10
+    gamma_jitter: 0.10
+    blur_probability: 0.15
+    max_blur_radius: 0.40
+    # 灰度值范围为 0～255，最大噪声标准差 2 约等于 0.8% 满量程。
+    noise_probability: 0.25
+    max_noise_std: 2.0
   # Windows 下使用多个常驻 worker 提前读取 patch，减少 GPU 等待磁盘/PIL 解码。
   num_workers: 4
-  pin_memory: true
+  pin_memory: false
   persistent_workers: true
   prefetch_factor: 2
   max_train_rows:
@@ -23,8 +38,14 @@ data:
   max_val_rows_per_finger:
 
 model:
-  dropout: 0.3   # 作用：随机丢弃部分特征，防止过拟合。推理时不生效
-  final_bn_affine: false  #作用：控制最后一层批归一化（BatchNorm）是否学习缩放和平移参数。
+  # 可选 hardnet_strong_v2、mobile_hardnet、hardnet。
+  architecture: hardnet_strong_v2
+  # 三种架构均支持自定义正整数维度；auto 使用默认值：Strong V2=256，其余=128。
+  descriptor_dim: 256
+  dropout: 0.12
+  # Strong V2 的 7 个残差块按深度从 0 线性增加到该概率；其他架构忽略此项。
+  drop_path_rate: 0.08
+  final_bn_affine: false
 
 training:
   # 明确要求 CUDA，避免 CUDA 版 PyTorch 缺失时静默退回 CPU。
@@ -32,12 +53,11 @@ training:
   # 卷积前向使用 FP16，hardest-negative 距离矩阵和 loss 仍使用 FP32。
   mixed_precision: fp16
   channels_last: true
-  cudnn_benchmark: false
+  cudnn_benchmark: false  #当前批处理输如的关键点数量不固定，每次搜索最优卷积算法花的时间很长。
   allow_tf32: true
-  # 指纹数据比 Brown patch 更难，最大训练 100 epoch，并支持从 last.pt 续训。
-  epochs: 500
+  # 允许长程训练并保留 last.pt 续训；当前固定协议可用于稳定观察过拟合拐点。
+  epochs: 100
   steps_per_epoch: 1000
-  val_steps: 200
   # 单手指点数不足会从已选样本重复采样补齐；整个 batch 仍不足则丢弃。伪负样本由 point_group 屏蔽。
   batch_size: 256
   # fingers_per_batch=1 时，每 batch 只选 1 根手指，全部 256 对来自同一手指的一个两图组合。
@@ -46,20 +66,65 @@ training:
   # - same_finger_allowed: allow same-finger negatives, but mask connected point_group.
   # - different_finger: only use negatives from different finger_id values.
   hard_negative_strategy: same_finger_allowed
+  # 同指且位于同一原图坐标系的候选必须在锚点中心 32x32 方形邻域之外：
+  # max(|dx|, |dy|) >= 16；跨指或跨图候选不比较原始坐标。
+  same_finger_min_coordinate_separation_px: 16
   # 每条正样本从双向合法候选中选择距离最小的 k 个负样本；设为 1 可复现原来的 hardest-negative。
   hard_negative_top_k: 3
+  # top-1 使用该权重；其余有效 top-k 负样本均分剩余权重。0.6 会让最近负样本获得主要梯度。
+  hard_negative_top1_weight: 0.6
+  # 对有效正样本的 p95/p99 距离施加平方 hinge 约束；目标是单位描述子的 L2 距离。
+  # p99 在 batch=256 时样本数较少，因此默认权重低于 p95，避免训练抖动。
+  positive_tail_loss_weight: 0.10
+  positive_tail_p95_weight: 0.7
+  positive_tail_p99_weight: 0.3
+  positive_tail_p95_target: 0.60
+  positive_tail_p99_target: 0.80
   # 论文 margin 是 1.0；当前指纹 patch 先保留较温和的 0.8。
-  margin: 1.0
+  margin: 0.9
   # 长训练先禁用早停；需要时可命令行设置 --early-stop-patience。
   early_stop_patience: 0
   early_stop_min_relative_improvement: 0.002
   scheduler: warmup_cosine
-  warmup_epochs: 2
+  warmup_epochs: 3
   eta_min: 0.0001
   log_interval: 50
 
+validation:
+  # 固定候选池协议：完整合法候选计算 ROC/FPR，动态 top-k 仅计算排序与 loss。
+  protocol: fixed_candidate_pool_v3
+  seed: 10042
+  # auto 使用 min(验证集可用手指数, batch_size)，保证每根手指至少贡献 1 对样本。
+  # batch_count 只控制固定验证 batch 数；image_pair 不足时会确定性循环，不会因此报错。
+  finger_count: auto
+  batch_count: 256
+  # batch_size=正样本对数
+  batch_size: 32
+
+# 匹配导向的综合选择：各指标先转换为 [0, 1] 的“越大越好”分量，
+# 再按以下权重求和：score = sum(normalized_weight_i * component_i)。
+# 非负权重会按总和自动归一化，但权重总和必须大于 0。
+checkpoint_selection:
+  strategy: matching_composite_v1
+  weights:
+    # 动态 hard top-k margin loss：1 - clamp(val_loss / (2 + margin), 0, 1)。
+    loss: 0.30
+    # 完整合法候选池均值间隔：clamp((val_neg_mean - val_pos_mean) / 2, 0, 1)。
+    distance_gap: 0.20
+    # 完整合法候选池误接受：1 - clamp(val_fpr_at_tpr95, 0, 1)。
+    fpr_at_tpr95: 0.35
+    # 正样本尾部距离：1 - clamp(val_pos_p95 / 2, 0, 1)。
+    pos_p95: 0.15
+
 optimizer:
-  # 这里显式使用 3.0；如需复现实验中的 lr=10，可直接把此处改为 10.0。
-  lr: 10.0
+  # 默认使用 SGD + Nesterov。切换为 adamw 时也要显式设置对应学习率，
+  # 不会静默改写 lr，确保 resolved_config 能准确记录实验变量。
+  name: sgd
+  lr: 0.08
   momentum: 0.9
+  nesterov: true
+  # 仅 Conv/Linear 权重衰减；BatchNorm 参数和所有 bias 固定为 no-decay。
   weight_decay: 0.0001
+  # 仅 AdamW 使用。
+  betas: [0.9, 0.999]
+  eps: 1.0e-8

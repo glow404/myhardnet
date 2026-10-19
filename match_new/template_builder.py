@@ -23,7 +23,18 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from match_new.descriptor_contract import (
+    BINARY_DESCRIPTOR_KIND,
+    DESCRIPTOR_SCHEMA_VERSION,
+    FLOAT32_STORAGE,
+    FLOAT_DESCRIPTOR_KIND,
+    L2_DISTANCE_METRIC,
+    descriptor_columns,
+    require_supported_contract,
+    resolve_descriptor_contract,
+)
 from match_new.runtime import (
+    HARDNET_INFERENCE_STAGE_FIELDS,
     HardNetDescriptor,
     build_sift,
     detect_sift_keypoints,
@@ -31,7 +42,7 @@ from match_new.runtime import (
     patchable_keypoints,
 )
 
-from .utils import ensure_dir, template_filename, write_csv_rows, write_json
+from .utils import ensure_dir, template_filename, write_json
 
 
 LOGGER = logging.getLogger(__name__)
@@ -72,12 +83,16 @@ def hardnet_template_payload(
     keypoints: list[cv2.KeyPoint],
     hardnet_descriptors: np.ndarray,
     overlap_image: np.ndarray,
+    *,
+    descriptor_kind: str = FLOAT_DESCRIPTOR_KIND,
+    descriptor_metric: str = L2_DISTANCE_METRIC,
+    descriptor_dim: int | None = None,
+    descriptor_storage: str = FLOAT32_STORAGE,
+    descriptor_bitorder: str = "",
+    descriptor_transform_name: str = "",
+    descriptor_transform_id: str = "",
 ) -> dict[str, Any]:
-    """构造注册阶段和在线解锁共用的内存模板结构。
-
-    该结构同时保留关键点几何信息、HardNet 描述子和纹理验证所需的灰度图。
-    在线查询直接使用返回的字典，不需要先写入再读取 ``.npz`` 文件。
-    """
+    """构造离线注册/评估共用的内存模板结构。"""
 
     xy = np.asarray([kp.pt for kp in keypoints], dtype=np.float32).reshape(-1, 2)
     gray = np.asarray(overlap_image)
@@ -85,9 +100,28 @@ def hardnet_template_payload(
         raise ValueError(f"overlap_image must be a 2D grayscale image, got {gray.shape}")
     if gray.dtype != np.uint8:
         gray = np.clip(gray, 0, 255).astype(np.uint8)
-    descriptors = np.asarray(hardnet_descriptors, dtype=np.float32)
-    return {
-        "template_format_version": 2,
+    kind = str(descriptor_kind).strip().lower()
+    descriptors = np.asarray(
+        hardnet_descriptors,
+        dtype=np.uint8 if kind == BINARY_DESCRIPTOR_KIND else np.float32,
+    )
+    if descriptors.ndim != 2:
+        raise ValueError(
+            f"hardnet_descriptors must be [N,D], got {descriptors.shape}"
+        )
+    if descriptors.shape[0] != len(keypoints):
+        raise ValueError(
+            "HardNet descriptor/keypoint row mismatch: "
+            f"descriptors={descriptors.shape[0]}, keypoints={len(keypoints)}"
+        )
+    dimension = int(
+        descriptor_dim if descriptor_dim is not None else descriptors.shape[1]
+    )
+    if dimension <= 0:
+        raise ValueError(f"HardNet descriptor dimension must be positive, got {dimension}")
+    template = {
+        "template_format_version": 6,
+        "descriptor_schema_version": DESCRIPTOR_SCHEMA_VERSION,
         "identity_id": str(row["identity_id"]),
         "image_id": str(row["image_id"]),
         "image_path": str(row["image_path"]),
@@ -99,6 +133,13 @@ def hardnet_template_payload(
         ),
         "keypoints_response": np.asarray([kp.response for kp in keypoints], dtype=np.float32),
         "hardnet_descriptors": descriptors,
+        "hardnet_descriptor_dim": dimension,
+        "hardnet_descriptor_kind": kind,
+        "hardnet_descriptor_metric": str(descriptor_metric).strip().lower(),
+        "hardnet_descriptor_storage": str(descriptor_storage).strip().lower(),
+        "hardnet_descriptor_bitorder": str(descriptor_bitorder).strip().lower(),
+        "hardnet_descriptor_transform_name": str(descriptor_transform_name).strip(),
+        "hardnet_descriptor_transform_id": str(descriptor_transform_id).strip(),
         "sift_descriptors": np.zeros((0, 128), dtype=np.float32),
         "overlap_image": gray,
         "template_path": "",
@@ -106,6 +147,15 @@ def hardnet_template_payload(
         "has_sift": False,
         "has_overlap_image": True,
     }
+    contract = resolve_descriptor_contract(template, "hardnet")
+    require_supported_contract(contract, label=str(row.get("image_id", "<memory>")))
+    expected_shape = (len(keypoints), descriptor_columns(contract))
+    if descriptors.shape != expected_shape:
+        raise ValueError(
+            "HardNet descriptor shape does not match its contract: "
+            f"descriptors={descriptors.shape}, expected={expected_shape}."
+        )
+    return template
 
 
 def save_hardnet_template_payload(output_path: str | Path, template: dict[str, Any]) -> Path:
@@ -113,10 +163,27 @@ def save_hardnet_template_payload(output_path: str | Path, template: dict[str, A
 
     target = Path(output_path).expanduser()
     ensure_dir(target.parent)
+    contract = resolve_descriptor_contract(template, "hardnet")
+    require_supported_contract(contract, label=str(target))
+    descriptors = np.asarray(
+        template["hardnet_descriptors"],
+        dtype=np.uint8 if contract.kind == BINARY_DESCRIPTOR_KIND else np.float32,
+    )
+    expected_columns = descriptor_columns(contract)
+    if descriptors.ndim != 2 or descriptors.shape[1] != expected_columns:
+        raise ValueError(
+            "HardNet template descriptor contract mismatch before save: "
+            f"path={target}, descriptors={descriptors.shape}, "
+            f"dimension={contract.dimension}, storage={contract.storage}."
+        )
     np.savez_compressed(
         target,
         template_format_version=np.asarray(
-            int(template.get("template_format_version", 2)),
+            int(template.get("template_format_version", 4)),
+            dtype=np.uint8,
+        ),
+        descriptor_schema_version=np.asarray(
+            int(template.get("descriptor_schema_version", DESCRIPTOR_SCHEMA_VERSION)),
             dtype=np.uint8,
         ),
         identity_id=np.asarray(template["identity_id"]),
@@ -126,7 +193,29 @@ def save_hardnet_template_payload(output_path: str | Path, template: dict[str, A
         keypoints_size=np.asarray(template["keypoints_size"], dtype=np.float32),
         keypoints_angle=np.asarray(template["keypoints_angle"], dtype=np.float32),
         keypoints_response=np.asarray(template["keypoints_response"], dtype=np.float32),
-        hardnet_descriptors=np.asarray(template["hardnet_descriptors"], dtype=np.float32),
+        hardnet_descriptors=descriptors,
+        hardnet_descriptor_dim=np.asarray(
+            int(template["hardnet_descriptor_dim"]),
+            dtype=np.int32,
+        ),
+        hardnet_descriptor_kind=np.asarray(
+            str(template.get("hardnet_descriptor_kind", FLOAT_DESCRIPTOR_KIND))
+        ),
+        hardnet_descriptor_metric=np.asarray(
+            str(template.get("hardnet_descriptor_metric", L2_DISTANCE_METRIC))
+        ),
+        hardnet_descriptor_storage=np.asarray(
+            str(template.get("hardnet_descriptor_storage", FLOAT32_STORAGE))
+        ),
+        hardnet_descriptor_bitorder=np.asarray(
+            str(template.get("hardnet_descriptor_bitorder", ""))
+        ),
+        hardnet_descriptor_transform_name=np.asarray(
+            str(template.get("hardnet_descriptor_transform_name", ""))
+        ),
+        hardnet_descriptor_transform_id=np.asarray(
+            str(template.get("hardnet_descriptor_transform_id", ""))
+        ),
         overlap_image=np.asarray(template["overlap_image"], dtype=np.uint8),
     )
     template["template_path"] = str(target)
@@ -158,7 +247,7 @@ def build_hardnet_template_from_image(
 
     返回值中的第一项是可直接参与匹配的内存模板；第二项包含图像读取、SIFT
     关键点检测、局部块提取、HardNet 描述子推理及总耗时。注册流程会进一步
-    持久化模板，在线解锁则只在本次请求期间保留该模板。
+    持久化模板，内存中的 query 模板可供离线评估流程直接匹配。
     """
 
     total_started = time.perf_counter()
@@ -195,6 +284,20 @@ def build_hardnet_template_from_image(
     started = time.perf_counter()
     hardnet_descriptors = hardnet.describe(patches)
     hardnet_ms = (time.perf_counter() - started) * 1000.0
+    inference_details = getattr(hardnet, "last_timings", {})
+    inference_stages = {
+        field: float(inference_details.get(field, 0.0))
+        for field in HARDNET_INFERENCE_STAGE_FIELDS
+    }
+    if inference_details:
+        # Include the describe() wrapper in the same total, without double counting.
+        inference_stages["hardnet_inference_overhead_ms"] = max(
+            0.0,
+            hardnet_ms - sum(
+                value for field, value in inference_stages.items()
+                if field != "hardnet_inference_overhead_ms"
+            ),
+        )
     if hardnet_descriptors.shape[0] != len(selected_keypoints):
         raise ValueError("descriptor/keypoint alignment failed")
 
@@ -204,6 +307,13 @@ def build_hardnet_template_from_image(
         selected_keypoints,
         hardnet_descriptors,
         image,
+        descriptor_kind=hardnet.descriptor_kind,
+        descriptor_metric=hardnet.descriptor_metric,
+        descriptor_dim=hardnet.descriptor_dim,
+        descriptor_storage=hardnet.descriptor_storage,
+        descriptor_bitorder=hardnet.descriptor_bitorder,
+        descriptor_transform_name=hardnet.descriptor_transform_name,
+        descriptor_transform_id=hardnet.descriptor_transform_id,
     )
     template_assembly_ms = (time.perf_counter() - started) * 1000.0
     template_total_ms = (time.perf_counter() - total_started) * 1000.0
@@ -224,6 +334,8 @@ def build_hardnet_template_from_image(
         "patch_extract_ms": patch_extract_ms,
         "hardnet_inference_ms": hardnet_ms,
         "hardnet_ms": hardnet_ms,
+        **inference_stages,
+        "hardnet_inference_profiled": bool(inference_details),
         "template_assembly_ms": template_assembly_ms,
         "template_pipeline_overhead_ms": max(
             0.0,
@@ -262,11 +374,72 @@ def load_image_template(path: str | Path, *, require: str | None = None) -> dict
             raise ValueError(f"模板缺少描述子字段: {target}")
 
         n_xy = int(np.asarray(data["keypoints_xy"]).reshape(-1, 2).shape[0]) if "keypoints_xy" in keys else 0
-        hardnet = (
-            np.asarray(data["hardnet_descriptors"], dtype=np.float32)
-            if has_hardnet
-            else np.zeros((0, 128), dtype=np.float32)
+        saved_kind = (
+            str(np.asarray(data["hardnet_descriptor_kind"]).item()).strip().lower()
+            if "hardnet_descriptor_kind" in keys
+            else FLOAT_DESCRIPTOR_KIND
         )
+        hardnet = (
+            np.asarray(
+                data["hardnet_descriptors"],
+                dtype=(
+                    np.uint8
+                    if saved_kind == BINARY_DESCRIPTOR_KIND
+                    else np.float32
+                ),
+            )
+            if has_hardnet
+            else np.zeros((0, 0), dtype=np.float32)
+        )
+        hardnet_contract_source: dict[str, Any] = {
+            "hardnet_descriptors": hardnet,
+            "template_path": str(target),
+        }
+        for field in (
+            "hardnet_descriptor_dim",
+            "hardnet_descriptor_kind",
+            "hardnet_descriptor_metric",
+            "hardnet_descriptor_storage",
+            "hardnet_descriptor_bitorder",
+            "hardnet_descriptor_transform_name",
+            "hardnet_descriptor_transform_id",
+        ):
+            if field in keys:
+                hardnet_contract_source[field] = np.asarray(data[field]).item()
+        if has_hardnet:
+            hardnet_contract = resolve_descriptor_contract(
+                hardnet_contract_source,
+                "hardnet",
+            )
+            require_supported_contract(hardnet_contract, label=str(target))
+            hardnet_descriptor_dim = hardnet_contract.dimension
+            hardnet_descriptor_kind = hardnet_contract.kind
+            hardnet_descriptor_metric = hardnet_contract.metric
+            hardnet_descriptor_storage = hardnet_contract.storage
+            hardnet_descriptor_bitorder = hardnet_contract.bitorder
+            hardnet_descriptor_transform_name = hardnet_contract.transform_name
+            hardnet_descriptor_transform_id = hardnet_contract.transform_id
+            expected_descriptor_columns = descriptor_columns(hardnet_contract)
+        else:
+            hardnet_descriptor_dim = 0
+            hardnet_descriptor_kind = FLOAT_DESCRIPTOR_KIND
+            hardnet_descriptor_metric = L2_DISTANCE_METRIC
+            hardnet_descriptor_storage = FLOAT32_STORAGE
+            hardnet_descriptor_bitorder = ""
+            hardnet_descriptor_transform_name = ""
+            hardnet_descriptor_transform_id = ""
+            expected_descriptor_columns = 0
+        if has_hardnet and (
+            hardnet.ndim != 2
+            or hardnet.shape[0] != n_xy
+            or hardnet.shape[1] != expected_descriptor_columns
+        ):
+            raise ValueError(
+                "HardNet 模板描述子/关键点/元数据不一致: "
+                f"{target}: descriptors={hardnet.shape}, keypoints={n_xy}, "
+                f"descriptor_dim={hardnet_descriptor_dim}, "
+                f"storage={hardnet_descriptor_storage}"
+            )
         sift = (
             np.asarray(data["sift_descriptors"], dtype=np.float32)
             if has_sift
@@ -274,6 +447,7 @@ def load_image_template(path: str | Path, *, require: str | None = None) -> dict
         )
         return {
             "template_format_version": int(np.asarray(data["template_format_version"]).item()) if "template_format_version" in keys else 1,
+            "descriptor_schema_version": int(np.asarray(data["descriptor_schema_version"]).item()) if "descriptor_schema_version" in keys else 0,
             "identity_id": str(np.asarray(data["identity_id"]).item()),
             "image_id": str(np.asarray(data["image_id"]).item()),
             "image_path": str(np.asarray(data["image_path"]).item()),
@@ -282,6 +456,13 @@ def load_image_template(path: str | Path, *, require: str | None = None) -> dict
             "keypoints_angle": np.asarray(data["keypoints_angle"], dtype=np.float32) if "keypoints_angle" in keys else np.zeros((n_xy,), dtype=np.float32),
             "keypoints_response": np.asarray(data["keypoints_response"], dtype=np.float32) if "keypoints_response" in keys else np.zeros((n_xy,), dtype=np.float32),
             "hardnet_descriptors": hardnet,
+            "hardnet_descriptor_dim": hardnet_descriptor_dim,
+            "hardnet_descriptor_kind": hardnet_descriptor_kind,
+            "hardnet_descriptor_metric": hardnet_descriptor_metric,
+            "hardnet_descriptor_storage": hardnet_descriptor_storage,
+            "hardnet_descriptor_bitorder": hardnet_descriptor_bitorder,
+            "hardnet_descriptor_transform_name": hardnet_descriptor_transform_name,
+            "hardnet_descriptor_transform_id": hardnet_descriptor_transform_id,
             "sift_descriptors": sift,
             "overlap_image": np.asarray(data["overlap_image"], dtype=np.uint8) if "overlap_image" in keys else np.zeros((0, 0), dtype=np.uint8),
             "template_path": str(target),
@@ -379,34 +560,93 @@ def build_hardnet_templates(
         "errors": errors,
         "template_timings": timings,
         "descriptor_type": "hardnet",
+        "descriptor_kind": hardnet.descriptor_kind,
+        "descriptor_metric": hardnet.descriptor_metric,
+        "descriptor_dim": hardnet.descriptor_dim,
+        "descriptor_storage": hardnet.descriptor_storage,
+        "descriptor_bitorder": hardnet.descriptor_bitorder,
+        "descriptor_transform_name": hardnet.descriptor_transform_name,
+        "descriptor_transform_id": hardnet.descriptor_transform_id,
+        "inference_settings": hardnet.inference_settings(),
     }
+
+
+def apply_identity_template_split(
+    rows: list[dict[str, str]],
+    identities: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """根据注册模板索引在内存中标记 enroll/query，避免持久化中间 split CSV。"""
+
+    enrolled = {
+        (str(identity["identity_id"]), str(image_id))
+        for identity in identities
+        for image_id in identity.get("template_image_ids", [])
+    }
+    return [
+        {
+            **row,
+            "split": (
+                "enroll"
+                if (str(row["identity_id"]), str(row["image_id"])) in enrolled
+                else "query"
+            ),
+        }
+        for row in rows
+    ]
+
+
+def select_enrollment_rows(
+    candidates: list[dict[str, str]],
+    enrollment_count: int,
+    selection_strategy: str,
+    *,
+    seed: int = 42,
+) -> list[dict[str, str]]:
+    """按目录扫描顺序从候选图像中选择注册模板。"""
+
+    ordered = list(candidates)
+    count = max(0, int(enrollment_count))
+    if count <= 0 or not ordered:
+        return []
+    strategy = str(selection_strategy or "first").strip().lower()
+    if strategy == "first":
+        return ordered[: min(count, len(ordered))]
+    if strategy == "stride":
+        step = max(1, len(ordered) // count)
+        return ordered[::step][:count]
+    if strategy == "random":
+        return random.Random(int(seed)).sample(ordered, min(count, len(ordered)))
+    raise ValueError(
+        "enrollment.selection_strategy 仅支持 first、stride 或 random，"
+        f"收到: {selection_strategy!r}"
+    )
 
 
 def build_identity_templates(
     rows: list[dict[str, str]],
     output_path: str | Path,
-    split_metadata_output: str | Path,
     enrollment_count: int,
-    seed: int,
-) -> dict[str, Any]:
-    """为每个 identity 随机选择注册模板，并写出 split metadata。"""
+    seed: int = 42,
+    selection_strategy: str = "first",
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """为每个 identity 选择注册模板，并返回内存中的 query 划分。"""
 
     groups: dict[str, list[dict[str, str]]] = defaultdict(list)
     for row in rows:
         groups[row["identity_id"]].append(row)
 
-    rng = random.Random(int(seed))
-    selected: set[tuple[str, str]] = set()
+    strategy = str(selection_strategy or "first").strip().lower()
     identities: list[dict[str, Any]] = []
     warnings: list[str] = []
-    for identity_id in sorted(groups):
-        candidates = sorted(groups[identity_id], key=lambda item: item["image_id"])
-        rng.shuffle(candidates)
-        chosen = candidates[: min(int(enrollment_count), len(candidates))]
+    for identity_id in groups:
+        chosen = select_enrollment_rows(
+            groups[identity_id],
+            enrollment_count,
+            strategy,
+            seed=int(seed),
+        )
         if len(chosen) < int(enrollment_count):
             warnings.append(f"{identity_id} has only {len(chosen)} templates")
-        for row in chosen:
-            selected.add((row["identity_id"], row["image_id"]))
         identities.append(
             {
                 "identity_id": identity_id,
@@ -416,20 +656,17 @@ def build_identity_templates(
             }
         )
 
-    split_rows = []
-    for row in rows:
-        split_rows.append({**row, "split": "enroll" if (row["identity_id"], row["image_id"]) in selected else "query"})
-    write_csv_rows(split_metadata_output, split_rows)
     payload = {
         "enrollment_images_per_identity": int(enrollment_count),
-        "selection_strategy": "random",
+        "selection_strategy": strategy,
         "random_seed": int(seed),
         "num_identities": len(identities),
         "identities": identities,
         "warnings": warnings,
     }
+    split_rows = apply_identity_template_split(rows, identities)
     write_json(output_path, payload)
-    return payload
+    return payload, split_rows
 
 
 def load_identity_templates(path: str | Path) -> list[dict[str, Any]]:

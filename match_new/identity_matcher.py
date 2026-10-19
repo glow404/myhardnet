@@ -1,9 +1,7 @@
-"""离线阈值评估与在线解锁共用的 identity 级匹配实现。
+"""离线阈值评估共用的 identity 级匹配实现。
 
 一个已注册手指由多张图像模板组成。本模块负责逐模板计算图像级分数，再按配置
-融合为一个 identity 级分数。离线评估必须遍历全部模板以获得真实完整分数；
-在线解锁在最大值类融合下可于任一模板达到固定阈值后提前结束，同时保持接受/
-拒绝结论与完整遍历一致。
+融合为一个 identity 级分数。评估可根据配置在达到阈值后提前停止；需要完整曲线时关闭早停。
 """
 
 from __future__ import annotations
@@ -14,7 +12,7 @@ from typing import Any
 
 import numpy as np
 
-from match_new.hardnet_matcher import match_templates_descriptor_l2
+from match_new.hardnet_matcher import match_templates_descriptor
 from match_new.template_builder import load_image_template
 
 
@@ -26,9 +24,8 @@ def load_template_cached(
 ) -> dict[str, Any]:
     """加载一份图像模板并放入进程内缓存。
 
-    缓存键同时包含文件路径和描述子类型要求，防止同一路径在 HardNet/SIFT
-    两种加载约束下错误复用。在线引擎可在启动阶段预加载注册模板，避免把磁盘
-    读取时间计入每次解锁。
+    缓存键同时包含文件路径和描述子类型要求，防止同一路径在不同加载约束下错误复用。
+    评估流程可在开始阶段预加载注册模板，避免把磁盘读取时间计入匹配时间。
     """
 
     key = str(Path(path).expanduser())
@@ -65,6 +62,53 @@ def fuse_image_results(results: list[dict[str, Any]], method: str) -> float:
     raise ValueError(f"unsupported fusion method: {method}")
 
 
+def resolve_early_stop_threshold(config: dict[str, Any]) -> float | None:
+    """根据 identification 配置解析早停阈值；关闭早停时返回 None。"""
+
+    identification_cfg = dict(config.get("identification", {}))
+    if not bool(identification_cfg.get("early_stop_on_unlock_threshold", True)):
+        return None
+    fusion_method = str(identification_cfg.get("fusion_method", "max")).lower()
+    if fusion_method not in {"max", "max_quality_tiebreak"}:
+        raise ValueError(
+            "早停只支持 max 或 max_quality_tiebreak 融合；"
+            f"当前融合方式为 {fusion_method}"
+        )
+    configured_early_stop = identification_cfg.get("early_stop_threshold")
+    threshold_value = (
+        configured_early_stop
+        if configured_early_stop not in {"", None}
+        else identification_cfg.get("match_score_threshold", 0.55)
+    )
+    threshold = float(threshold_value)
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError(f"早停阈值必须位于 [0,1]，当前值为 {threshold}")
+    return threshold
+
+
+END_TO_END_EXCLUDED_MATCH_OVERHEAD_MS_FIELDS: tuple[str, ...] = (
+    "descriptor_prepare_ms",
+    "postprocess_ms",
+    "identity_match_overhead_ms",
+    "matching_wrapper_overhead_ms",
+)
+
+
+def sum_end_to_end_excluded_match_overhead_ms(row: dict[str, Any]) -> float:
+    """端到端耗时统计中不计入的匹配阶段杂项耗时之和。"""
+
+    return sum(
+        float(row.get(field, 0.0))
+        for field in END_TO_END_EXCLUDED_MATCH_OVERHEAD_MS_FIELDS
+    )
+
+
+def compute_end_to_end_core_ms(end_to_end_ms: float, row: dict[str, Any]) -> float:
+    """从墙钟端到端耗时中扣除不计入统计的匹配杂项。"""
+
+    return max(0.0, float(end_to_end_ms) - sum_end_to_end_excluded_match_overhead_ms(row))
+
+
 def score_query_against_identity(
     query_template: dict[str, Any],
     identity: dict[str, Any],
@@ -76,10 +120,8 @@ def score_query_against_identity(
 ) -> dict[str, Any]:
     """计算一份查询模板与一个已注册手指模板集合的匹配结果。
 
-    ``early_stop_threshold=None`` 时始终遍历全部注册模板，用于离线阈值扫描，
-    从而保留真实 identity 最大分数。在线解锁显式传入离线标定的固定阈值；
-    在最大值类融合下，一旦某张模板分数达到阈值，最终“接受”结论已不可逆，
-    因此可以提前返回。若全部模板均未达到阈值，则仍会完整遍历并返回“拒绝”。
+    ``early_stop_threshold=None`` 时始终遍历全部注册模板，用于完整阈值扫描，
+    从而保留真实 identity 最大分数。
     """
 
     identity_started = time.perf_counter()
@@ -92,6 +134,12 @@ def score_query_against_identity(
         if not 0.0 <= early_stop_threshold <= 1.0:
             raise ValueError(f"early_stop_threshold must be in [0,1], got {early_stop_threshold}")
     require = "sift" if str(descriptor_source).lower() in {"sift", "rootsift"} else "hardnet"
+    low_unique_inliers = int(
+        dict(config.get("texture_verification", {})).get(
+            "low_unique_inliers",
+            3,
+        )
+    )
 
     results: list[dict[str, Any]] = []
     best_index = -1
@@ -103,6 +151,7 @@ def score_query_against_identity(
         "candidate_filter_ms",
         "ransac_ms",
         "inlier_refinement_ms",
+        "unique_inlier_dedup_ms",
         "texture_similarity_ms",
         "score_fusion_ms",
         "postprocess_ms",
@@ -117,7 +166,7 @@ def score_query_against_identity(
             require=require,
         )
         template_load_ms += (time.perf_counter() - load_started) * 1000.0
-        result = match_templates_descriptor_l2(
+        result = match_templates_descriptor(
             query_template,
             gallery_template,
             config,
@@ -167,9 +216,14 @@ def score_query_against_identity(
     )
     return {
         "score": identity_score,
+        "descriptor_source": str(best.get("descriptor_source", descriptor_source)),
+        "descriptor_kind": str(best.get("descriptor_kind", "float")),
+        "descriptor_metric": str(best.get("descriptor_metric", "l2")),
+        "descriptor_dim": int(best.get("descriptor_dim", 0)),
         "best_template_path": paths[best_index] if best_index >= 0 else "",
         "best_template_image_id": str(best_template.get("image_id", "")),
         "best_template_image_path": str(best_template.get("image_path", "")),
+        "best_affine_matrix": best.get("affine_matrix"),
         "num_templates": len(paths),
         "num_templates_evaluated": len(results),
         "early_stopped": int(early_stopped),
@@ -177,6 +231,63 @@ def score_query_against_identity(
         "best_image_score": float(best.get("score", 0.0)),
         "best_quality_score": float(best.get("quality_score", 0.0)),
         "num_raw_matches": int(best.get("num_raw_matches", 0)),
+        "num_abs_distance_pass": int(best.get("num_abs_distance_pass", 0)),
+        "num_one_way_ratio_pass": int(best.get("num_one_way_ratio_pass", 0)),
+        "num_ratio_pass": int(best.get("num_ratio_pass", 0)),
+        "num_queries_with_candidates": int(best.get("num_queries_with_candidates", 0)),
+        "candidate_query_coverage": float(best.get("candidate_query_coverage", 0.0)),
+        "templates_with_candidates": sum(
+            int(item.get("num_candidates", 0) > 0) for item in results
+        ),
+        "templates_with_abs_distance_pass": sum(
+            int(item.get("num_abs_distance_pass", 0) > 0) for item in results
+        ),
+        "templates_with_ratio_pass": sum(
+            int(item.get("num_ratio_pass", 0) > 0) for item in results
+        ),
+        "templates_with_ransac_success": sum(
+            int(bool(item.get("ransac_success", False))) for item in results
+        ),
+        "templates_with_unique_inlier_ready": sum(
+            int(int(item.get("unique_inliers", 0)) >= low_unique_inliers)
+            for item in results
+        ),
+        "templates_with_texture_evaluated": sum(
+            int(bool(item.get("texture_evaluated", False))) for item in results
+        ),
+        "templates_with_texture_available": sum(
+            int(bool(item.get("texture_available", False))) for item in results
+        ),
+        "templates_with_fused_score": sum(
+            int(str(item.get("texture_decision", "")) == "fused_score")
+            for item in results
+        ),
+        "max_candidate_query_coverage": max(
+            (float(item.get("candidate_query_coverage", 0.0)) for item in results),
+            default=0.0,
+        ),
+        "max_num_candidates": max(
+            (int(item.get("num_candidates", 0)) for item in results),
+            default=0,
+        ),
+        "max_raw_inliers": max(
+            (int(item.get("raw_inliers", 0)) for item in results),
+            default=0,
+        ),
+        "max_unique_inliers": max(
+            (int(item.get("unique_inliers", 0)) for item in results),
+            default=0,
+        ),
+        "max_geometry_similarity": max(
+            (float(item.get("geometry_similarity", 0.0)) for item in results),
+            default=0.0,
+        ),
+        "max_texture_similarity": max(
+            (float(item.get("texture_similarity", 0.0)) for item in results),
+            default=0.0,
+        ),
+        "ransac_success": int(bool(best.get("ransac_success", False))),
+        "scale_rejected": int(bool(best.get("scale_rejected", False))),
         "num_candidates": int(best.get("num_candidates", 0)),
         "num_inliers": int(best.get("num_inliers", 0)),
         "raw_inliers": int(best.get("raw_inliers", 0)),
@@ -184,7 +295,13 @@ def score_query_against_identity(
         "unique_query_inliers": int(best.get("unique_query_inliers", 0)),
         "unique_gallery_inliers": int(best.get("unique_gallery_inliers", 0)),
         "inlier_ratio": float(best.get("inlier_ratio", 0.0)),
+        "mean_descriptor_distance": float(
+            best.get("mean_descriptor_distance", 0.0)
+        ),
         "mean_l2_distance": float(best.get("mean_l2_distance", 0.0)),
+        "mean_hamming_distance": float(
+            best.get("mean_hamming_distance", 0.0)
+        ),
         "mean_reproj_error": float(best.get("mean_reproj_error", 0.0)),
         "orientation_consistency": float(best.get("orientation_consistency", 0.0)),
         "dominant_angle_delta": float(best.get("dominant_angle_delta", 0.0)),

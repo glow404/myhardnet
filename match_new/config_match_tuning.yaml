@@ -1,0 +1,56 @@
+# match_new 常调实验参数
+#
+# 运行时仍使用 config_match_new.yaml；主配置会自动继承本文件。
+# 模型、数据集、输出目录、Hadamard 开关、注册数量及匹配阈值变化时，优先只修改这里。
+
+output:
+  output_dir: ../outputs/normal/m0_256_v2_hadamard_模板数40-数据集normal
+  
+
+runtime:
+  skip_template_build: false
+
+data:
+  image_root: ../data/normal_pic
+
+model:
+  checkpoint: ../outputs/models/3/m0/m0_256_v2/best.pt
+  # 对浮点 checkpoint 做 Hadamard 二值化；关闭后走浮点 L2。
+  hadamard_binarization:
+    enabled: true
+
+matching:
+  # 浮点 L2 候选阈值。
+  ratio_threshold: 0.85
+  bidirectional_ratio_test: false
+  abs_distance_threshold: 1.5
+  distance_margin: 0.15
+
+  # 二值 Hamming 候选阈值。
+  hamming:
+    backend: cpu
+    ratio_threshold: 0.90
+    abs_distance_threshold: 0.50
+    distance_margin: 0.05
+
+  allow_many_to_one_before_ransac: true
+
+texture_verification:
+  low_unique_inliers: 3
+  geometry_saturation_inliers: 12.0
+  geometry_weight: 0.70
+  texture_weight: 0.30
+  block_size: 16
+  blur_sigma: 0.8
+  min_block_std: 5.0
+  min_block_valid_fraction: 0.60
+  min_valid_blocks: 4
+  min_overlap_fraction: 0.20
+
+enrollment:
+  enrollment_images_per_identity: 40
+  # first：按 image_id 排序后取前 N 张（默认）。
+  # stride：按总数/N 计算步长后等间隔取样。
+  # random：按 random_seed 对每个身份独立无放回抽样。
+  selection_strategy: first
+  random_seed: 42

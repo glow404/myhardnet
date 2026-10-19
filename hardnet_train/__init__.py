@@ -1,6 +1,5 @@
 """指纹 patch 描述子训练包。
 
-本目录承接 `pair_build` 生成的正样本 patch 对，复现 HardNet 论文中的
-L2Net/HardNet 网络结构与 hardest-in-batch triplet loss，并加入适合小指纹
-图像的 batch 采样策略，尽量减少伪负样本对。
+包含兼容旧 checkpoint 的浮点 HardNet 系列、版本化 Strong V2 主干，以及与
+浮点主干解耦的 residual binary hash 训练链路。
 """

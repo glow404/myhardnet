@@ -27,7 +27,7 @@ if str(ROOT) not in sys.path:
 
 from match_new.hardnet_matcher import match_templates_descriptor_l2
 from match_new.template_builder import build_hardnet_templates, build_identity_templates, load_image_template
-from match_new.utils import ensure_dir, load_config, read_csv_rows, resolve_path, safe_id, template_filename, write_csv_rows, write_json
+from match_new.utils import ensure_dir, load_config, resolve_path, safe_id, template_filename, write_csv_rows, write_json
 
 
 MATCH_NEW_DIR = Path(__file__).resolve().parent
@@ -57,7 +57,6 @@ def parse_args() -> argparse.Namespace:
         help="Minimum unique_inliers for bottom cases. Default: 3.",
     )
     parser.add_argument("--max_lines", type=int, default=200, help="Maximum lines to draw per visualization.")
-    parser.add_argument("--identity_depth", type=int, default=1, help="How many path levels under image_root form identity_id.")
     parser.add_argument(
         "--include_impostor",
         action="store_true",
@@ -77,35 +76,15 @@ def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
         config.setdefault("enrollment", {})["enrollment_images_per_identity"] = int(args.enrollment_count)
 
 
-def scan_image_rows(image_root: str | Path, identity_depth: int) -> list[dict[str, str]]:
-    """从原始图像目录扫描 metadata。
+def scan_image_rows(image_root: str | Path) -> list[dict[str, str]]:
+    """从原始图像目录扫描 metadata；固定为 image_root/<手指目录>/图像。"""
 
-    默认 `identity_depth=1`，即 `pair_build/select_top500/zyh_L0/pair_1.bmp`
-    会得到：
-      identity_id = zyh_L0
-      image_id = pair_1
-      image_path = 原图绝对路径
-    """
+    from match_new.input_loader import scan_image_metadata
 
-    root = Path(image_root).expanduser().resolve()
-    rows: list[dict[str, str]] = []
-    for path in sorted(root.rglob("*")):
-        if path.suffix.lower() not in IMAGE_EXTENSIONS:
-            continue
-        rel = path.relative_to(root)
-        if len(rel.parts) <= identity_depth:
-            continue
-        identity_id = "/".join(rel.parts[:identity_depth])
-        rows.append(
-            {
-                "identity_id": identity_id,
-                "image_id": path.stem,
-                "image_path": str(path.resolve()),
-                "split": "",
-            }
-        )
-    return rows
-
+    return scan_image_metadata(
+        image_root,
+        validate_readable=False,
+    )
 
 def imread_grayscale(path: str | Path) -> np.ndarray | None:
     """读取灰度图，兼容 Windows 中文路径。"""
@@ -452,16 +431,28 @@ def main() -> None:
 
     output_dir = ensure_dir(args.output_dir)
     template_dir = ensure_dir(output_dir / "image_templates")
-    rows = scan_image_rows(args.image_root, int(args.identity_depth))
+    rows = scan_image_rows(args.image_root)
     if not rows:
         raise RuntimeError(f"No images found under {args.image_root}")
     write_csv_rows(output_dir / "metadata_all.csv", rows)
 
-    metadata_success_path = output_dir / "metadata_success.csv"
     if args.skip_template_build:
-        if not metadata_success_path.exists():
-            raise RuntimeError("--skip_template_build requires output_dir/metadata_success.csv")
-        success_rows = read_csv_rows(metadata_success_path)
+        success_rows = []
+        for row in rows:
+            template_path = template_dir / template_filename(
+                row["identity_id"],
+                row["image_id"],
+            )
+            if template_path.exists():
+                success_rows.append(
+                    {
+                        **row,
+                        "template_path": str(template_path),
+                        "status": "success",
+                    }
+                )
+        if not success_rows:
+            raise RuntimeError("--skip_template_build requires existing image templates")
     else:
         report = build_hardnet_templates(rows, template_dir, config)
         write_json(output_dir / "build_report.json", {key: value for key, value in report.items() if key != "success_rows"})
@@ -469,21 +460,18 @@ def main() -> None:
         success_rows = report["success_rows"]
         if not success_rows:
             raise RuntimeError("No templates were built successfully.")
-        write_csv_rows(metadata_success_path, success_rows)
 
     enrollment = dict(config.get("enrollment", {}))
     enrollment_count = int(enrollment.get("enrollment_images_per_identity", 20))
     random_seed = int(enrollment.get("random_seed", 42))
     identity_templates_path = output_dir / f"identity_templates_{enrollment_count}.json"
-    split_metadata_path = output_dir / f"metadata_with_split_{enrollment_count}.csv"
-    identity_payload = build_identity_templates(
+    identity_payload, split_rows = build_identity_templates(
         success_rows,
         identity_templates_path,
-        split_metadata_path,
         enrollment_count=enrollment_count,
         seed=random_seed,
+        selection_strategy=str(enrollment.get("selection_strategy", "first")),
     )
-    split_rows = read_csv_rows(split_metadata_path)
 
     cases = score_genuine_pairs(
         split_rows=split_rows,
